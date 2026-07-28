@@ -221,6 +221,11 @@ class TiledOptimizer:
         # Seeded to 0 so a fresh run reads as "everything just changed" and
         # cannot exit before it has any history.
         self.last_change_iter = np.zeros(len(self.parcel_n_ids), dtype=np.int64)
+        # Cumulative parcel-relabel events, and periodic marks of it, so the
+        # convergence test can ask "how many of the parcels I touched recently
+        # were touched for the first time?" rather than measuring raw volume.
+        self.touch_events = 0
+        self._event_marks: List[Tuple[int, int]] = []
         self._stable_streak = 0
         self._last_batch = cfg.max_batch
         self.blocked_batches = 0  # batches where every candidate broke contiguity
@@ -548,6 +553,7 @@ class TiledOptimizer:
 
             self.parcel_n_ids[pidx] = n_recip
             self.last_change_iter[pidx] = self.iteration
+            self.touch_events += len(pidx)
             self.tile_n_ids[tile] = n_recip
             owned = self.n_to_tiles
             owned.setdefault(n_donor, set()).discard(tile)
@@ -568,6 +574,7 @@ class TiledOptimizer:
             self.parcel_n_ids[p_j] = n_i
             self.last_change_iter[p_i] = self.iteration
             self.last_change_iter[p_j] = self.iteration
+            self.touch_events += len(p_i) + len(p_j)
             self.tile_n_ids[ti], self.tile_n_ids[tj] = n_j, n_i
             owned = self.n_to_tiles
             owned.setdefault(n_i, set()).discard(ti)
@@ -587,13 +594,47 @@ class TiledOptimizer:
     # ------------------------------------------------------------------
 
     def recent_change_fraction(self) -> float:
-        """Share of this optimizer's parcels relabelled in the last window."""
+        """Share of this optimizer's parcels relabelled in the last window.
+
+        Diagnostic only -- see progress_ratio() for the convergence test. This
+        number is not comparable across dataset sizes.
+        """
         window = int(self.cfg.assignment_stability_iters)
         owned = self._owned_parcels
         if window <= 0 or not len(owned):
             return 1.0
         age = self.iteration - self.last_change_iter[owned]
         return float(np.count_nonzero(age < window)) / len(owned)
+
+    def _events_in_window(self, window: int) -> Optional[int]:
+        """Relabel events in the last ``window`` iterations, or None if unknown."""
+        cutoff = self.iteration - window
+        base = None
+        for it, cum in self._event_marks:
+            if it <= cutoff:
+                base = cum
+        if base is None:
+            return None  # not a full window of history yet
+        return self.touch_events - base
+
+    def progress_ratio(self, window: int) -> Optional[float]:
+        """Distinct parcels changed / relabel events, over the window.
+
+        ~1.0 while the optimizer keeps reaching fresh ground; toward 0 once it is
+        just shuffling the same tiles between the same neighborhoods. Both terms
+        scale together with dataset size, so the ratio does not.
+        """
+        events = self._events_in_window(window)
+        if events is None:
+            return None
+        if events <= 0:
+            return 0.0  # nothing moved at all
+        owned = self._owned_parcels
+        if not len(owned):
+            return 0.0
+        age = self.iteration - self.last_change_iter[owned]
+        distinct = int(np.count_nonzero(age < window))
+        return distinct / events
 
     def _assignment_converged(self) -> bool:
         """True once the map has stopped changing, not merely stopped improving.
@@ -605,16 +646,23 @@ class TiledOptimizer:
         15,000-tile mainland.
         """
         cfg = self.cfg
-        if not cfg.assignment_stability_iters:
+        window = int(cfg.assignment_stability_iters)
+        if not window:
             return False
+
+        self._event_marks.append((self.iteration, self.touch_events))
+        while len(self._event_marks) > 2 and \
+                self.iteration - self._event_marks[0][0] > 2 * window:
+            self._event_marks.pop(0)
+
         # Needs a full window of history first, or the initial all-zero
         # last_change_iter would read as "nothing changed recently".
-        if self.iteration < cfg.assignment_stability_iters:
+        if self.iteration < window:
             self._stable_streak = 0
             return False
 
-        frac = self.recent_change_fraction()
-        if frac >= cfg.assignment_stability_frac:
+        ratio = self.progress_ratio(window)
+        if ratio is None or ratio >= cfg.assignment_progress_ratio:
             self._stable_streak = 0
             return False
 
@@ -622,10 +670,10 @@ class TiledOptimizer:
         if self._stable_streak < cfg.assignment_stability_streak:
             return False
         self.progress(
-            f"Converged: under {100 * cfg.assignment_stability_frac:.1f}% of "
-            f"parcels changed in {cfg.assignment_stability_streak} consecutive "
-            f"{cfg.assignment_stability_iters:,}-iteration windows "
-            f"(last {100 * frac:.3f}%)."
+            f"Converged: only {100 * ratio:.1f}% of recent relabels reached "
+            f"parcels not already touched, for "
+            f"{cfg.assignment_stability_streak} consecutive {window:,}-iteration "
+            "windows -- the map is churning, not improving."
         )
         return True
 

@@ -111,12 +111,22 @@ class RunConfig:
     # actually change the map. Tracking how many parcels changed label recently
     # is scale-free and measures the thing we care about directly.
     #
-    # Stop once fewer than `assignment_stability_frac` of this optimizer's own
-    # parcels changed label within the last `assignment_stability_iters`
-    # iterations, for `assignment_stability_streak` consecutive checks.
-    # Set assignment_stability_iters = 0 to disable.
+    # The measure is *novelty*, not raw volume: over the last
+    # `assignment_stability_iters` iterations, how many distinct parcels changed
+    # label, divided by how many relabel events occurred? Every move touching
+    # fresh ground gives ~1.0; the same few tiles flipping back and forth drives
+    # it toward 0, which is what convergence actually looks like under annealing.
+    #
+    # Do NOT normalise by total parcels. That was the first attempt and it is
+    # backwards: a move relabels a fixed handful of parcels regardless of dataset
+    # size, so the achievable fraction *shrinks* as the data grows. At Lee County
+    # scale (276k parcels, 5 per tile) a 500-iteration window can never exceed
+    # ~1.8% even if every single iteration accepts -- so a 1% threshold fired
+    # during healthy operation and stopped the run near its KMeans seeding. Small
+    # test fixtures sit in a regime where the same threshold looks fine, which is
+    # why it took a county-sized run to surface.
     assignment_stability_iters: int = 500
-    assignment_stability_frac: float = 0.01
+    assignment_progress_ratio: float = 0.20
     assignment_stability_streak: int = 5
 
     # --- contiguity -------------------------------------------------------
