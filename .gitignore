@@ -1,5 +1,15 @@
+<<<<<<< HEAD
 runs/
 .mi_cache/
 __pycache__/
 *.py[cod]
 .venv/
+=======
+
+.mi_cache/
+.venv/
+__pycache__/
+mi_desktop.egg-info/*
+data/*
+runs/*
+>>>>>>> f9f637e (gitignore)
