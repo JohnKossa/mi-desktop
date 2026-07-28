@@ -298,40 +298,9 @@ def test_group_task_round_trips_through_pickle():
             }
 
 
-def test_stability_limit_is_scale_invariant_when_enabled():
-    """A flat miss count means different things on different-sized boundaries.
-
-    With ``stability_sweeps`` off, the limit is the raw count regardless of how
-    big the subproblem is. With it on, the limit tracks how many iterations it
-    takes to sweep that boundary once, so a small group and a large one stop at
-    comparable depth.
-    """
-    cfg = base_config()
-    parcels, t2p, adj, seed = build(cfg)
-    opt = engine.TiledOptimizer(parcels, t2p, adj, cfg, neighborhood_ids=seed)
-
-    # off by default: unchanged legacy behaviour
-    assert cfg.stability_sweeps == 0.0
-    assert opt.stability_limit() == cfg.max_stability
-
-    opt.cfg.stability_sweeps = 4.0
-    opt._last_batch = 8
-    small = len(opt.boundary)
-    limit_small_batch = opt.stability_limit()
-    opt._last_batch = 256
-    limit_big_batch = opt.stability_limit()
-    # a bigger batch sweeps the boundary in fewer iterations, so fewer misses
-    # are needed to conclude nothing is there
-    assert limit_small_batch >= limit_big_batch, (
-        limit_small_batch, limit_big_batch
-    )
-    # never drops below the configured floor
-    assert limit_big_batch >= cfg.max_stability
-
-    # and it scales with boundary size: shrink the boundary, shrink the limit
-    opt._last_batch = 8
-    opt.boundary = set(list(opt.boundary)[: max(1, small // 10)])
-    assert opt.stability_limit() <= limit_small_batch
+# The old `stability_sweeps` rule this used to cover was replaced by the
+# assignment-stability convergence test, which is scale-free by construction.
+# See tests/test_contiguity.py for its coverage.
 
 
 def test_weighted_score_ignores_singleton_inflation():

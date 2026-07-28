@@ -8,11 +8,13 @@ deprecated ``unary_union`` accessor).
 
 from __future__ import annotations
 
+import time
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import geopandas as gpd
 import numpy as np
 import pandas as pd
+import shapely
 from shapely.geometry import LineString, MultiLineString, box
 from shapely.ops import polygonize, unary_union
 
@@ -128,18 +130,60 @@ def clip_out(
     progress: Progress = _noop,
     min_area_sqft: float = 100.0,
 ) -> gpd.GeoDataFrame:
-    """Subtract ``mask`` (e.g. water) from every tile in ``base``."""
+    """Subtract ``mask`` (e.g. water) from an existing tileset.
+
+    ``build_tileset`` no longer needs this: it removes water from the study-area
+    polygon *before* shattering, which is one difference instead of one per tile.
+    Kept for clipping a tileset that has already been built.
+
+    Deliberately *not* ``base.geometry.difference(mask.union_all())``. That is the
+    obvious one-liner and it is a trap: the difference is elementwise against a
+    single MultiPolygon, so every tile pays the cost of the entire mask. With
+    380k tiles and a county's worth of OSM water (Cape Coral's canal network
+    alone runs to thousands of polygons) that measured at ~11 minutes and looks
+    exactly like a hang.
+
+    Instead, index the mask and only touch tiles that actually meet it -- usually
+    a small minority -- differencing each against just the mask parts that
+    overlap it. Same result, because parts that don't intersect a tile cannot
+    change it.
+    """
     if mask is None or len(mask) == 0:
         return base
     if base.crs != mask.crs:
         mask = mask.to_crs(base.crs)
 
-    progress(f"Clip: dissolving {len(mask):,} mask polygons...")
-    mask_union = mask.geometry.union_all()
+    base_geoms = base.geometry.to_numpy()
+    mask_geoms = mask.geometry.to_numpy()
 
-    progress("Clip: differencing tiles...")
-    clipped = base.geometry.difference(mask_union)
-    out = gpd.GeoDataFrame({"geometry": clipped}, crs=base.crs)
+    progress(f"Clip: indexing {len(mask):,} mask polygons...")
+    pairs = mask.sindex.query(base_geoms, predicate="intersects")
+    tile_idx, water_idx = pairs[0], pairs[1]
+    if len(tile_idx) == 0:
+        progress("Clip: no tile meets the mask; nothing to do")
+        return base
+
+    order = np.argsort(tile_idx, kind="stable")
+    tile_idx, water_idx = tile_idx[order], water_idx[order]
+    affected, starts, counts = np.unique(
+        tile_idx, return_index=True, return_counts=True
+    )
+    progress(
+        f"Clip: {len(affected):,} of {len(base):,} tiles meet the mask "
+        f"({len(tile_idx):,} overlaps)"
+    )
+
+    result = base_geoms.copy()
+    step = max(1, len(affected) // 10)
+    for k, (pos, start, count) in enumerate(zip(affected, starts, counts)):
+        cut = mask_geoms[water_idx[start]] if count == 1 else shapely.union_all(
+            mask_geoms[water_idx[start : start + count]]
+        )
+        result[pos] = shapely.difference(result[pos], cut)
+        if k and k % step == 0:
+            progress(f"Clip: {k:,}/{len(affected):,} tiles clipped")
+
+    out = gpd.GeoDataFrame({"geometry": result}, crs=base.crs)
     out = out[~out.geometry.is_empty & out.geometry.notna()]
     out = out.explode(ignore_index=True, index_parts=False)
     if min_area_sqft > 0:
@@ -179,12 +223,36 @@ def build_tileset(
 
     area = study_area.to_crs(working_crs)
     area_union = area.geometry.union_all()
+    # Grid origin comes from the *un-clipped* bounds so the lattice is identical
+    # whether or not water is removed.
     bounds = area_union.bounds
 
     blocks = prep(blocks)
     roads = prep(roads)
     waterway_lines = prep(waterway_lines)
     water_areas = prep(water_areas)
+
+    if clip_water and water_areas is not None:
+        # Cut water out of the study area *before* shattering rather than out of
+        # the finished tiles afterwards: one difference on one polygon instead of
+        # one per tile. Post-hoc clipping of 380k tiles measured at ~11 minutes.
+        # Two things then fall out for free -- the water outlines join the
+        # linework via the area boundary, so tiles stop at the shoreline, and the
+        # jurisdiction trim below drops water faces without a separate pass.
+        progress(f"Tileset: removing {len(water_areas):,} water polygons from the "
+                 "study area...")
+        t0 = time.perf_counter()
+        water_union = water_areas.geometry.union_all()
+        remaining = area_union.difference(water_union)
+        if remaining.is_empty:
+            progress(
+                "Tileset: WARNING water covers the entire study area; ignoring the "
+                "water clip so there is something left to tile."
+            )
+        else:
+            area_union = remaining
+            progress(f"Tileset: water removed in {time.perf_counter() - t0:.1f}s; "
+                     "shorelines are now cut lines")
 
     sources: List[gpd.GeoSeries] = [gpd.GeoSeries([area_union], crs=working_crs)]
 
@@ -205,15 +273,22 @@ def build_tileset(
 
     tiles = shatter(sources, working_crs, progress=progress)
 
-    # Everything outside the jurisdiction gets dropped (the study-area boundary
-    # is in the linework, so faces are cleanly inside or outside).
-    progress("Tileset: trimming to jurisdiction...")
-    inside = tiles[tiles.geometry.representative_point().within(area_union)]
-    progress(f"Tileset: {len(inside):,} tiles inside the jurisdiction")
-    tiles = inside.reset_index(drop=True)
-
-    if clip_water and water_areas is not None:
-        tiles = clip_out(tiles, water_areas, progress=progress)
+    # Everything outside the study area gets dropped -- including water, now that
+    # it has been subtracted from it. The area boundary is in the linework, so
+    # every face is cleanly inside or outside.
+    progress("Tileset: trimming to the study area...")
+    t0 = time.perf_counter()
+    points = tiles.geometry.representative_point().to_numpy()
+    # prepare() builds an internal index on the polygon. Without it, each of the
+    # ~380k point-in-polygon tests walks every ring of what is now a
+    # water-perforated multipolygon -- the same quadratic trap the clip had.
+    shapely.prepare(area_union)
+    # contains(area, point) is exactly the old point.within(area).
+    tiles = tiles[shapely.contains(area_union, points)]
+    progress(
+        f"Tileset: {len(tiles):,} tiles inside the study area "
+        f"({time.perf_counter() - t0:.1f}s)"
+    )
 
     tiles = tiles.reset_index(drop=True)
     tiles.index.name = "tile_id"

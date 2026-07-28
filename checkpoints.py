@@ -22,6 +22,7 @@ A run directory looks like::
 from __future__ import annotations
 
 import json
+import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -43,7 +44,27 @@ class Checkpoint:
     n_neighborhoods: int
     parcel_n_ids: np.ndarray
     rng_state: Optional[dict] = None
+    # Per-parcel iteration of last label change, for the assignment-stability
+    # convergence test. Optional, but see `Checkpoint.restore_last_change` --
+    # a missing array must never be read as zeros.
+    last_change_iter: Optional[np.ndarray] = None
+    assignment_stable_streak: int = 0
     extra: Dict[str, object] = field(default_factory=dict)
+
+    def restore_last_change(self, n_parcels: int) -> np.ndarray:
+        """The array to resume with, filled safely when it wasn't stored.
+
+        Zeros would be catastrophic rather than merely wrong: at iteration
+        50,000 every parcel would look 50,000 iterations stale, the recent-change
+        fraction would read 0%, and the run would declare convergence and exit
+        the moment it resumed. Filling with the checkpoint's iteration instead
+        means "everything just changed", which costs at most one extra window
+        before convergence can be detected.
+        """
+        if self.last_change_iter is not None and \
+                len(self.last_change_iter) == n_parcels:
+            return np.asarray(self.last_change_iter, dtype=np.int64).copy()
+        return np.full(n_parcels, int(self.iteration), dtype=np.int64)
 
     def meta(self) -> dict:
         return {
@@ -56,6 +77,8 @@ class Checkpoint:
             "n_neighborhoods": int(self.n_neighborhoods),
             "n_parcels": int(len(self.parcel_n_ids)),
             "rng_state": _jsonify(self.rng_state) if self.rng_state else None,
+            "assignment_stable_streak": int(self.assignment_stable_streak),
+            "has_last_change": self.last_change_iter is not None,
             "extra": self.extra,
         }
 
@@ -99,10 +122,26 @@ class CheckpointStore:
         tag = "final" if final else f"{cp.iteration:06d}"
         npz = self.dir / f"checkpoint_{tag}.npz"
         meta = self.dir / f"checkpoint_{tag}.json"
-        np.savez_compressed(
-            npz, parcel_n_ids=np.asarray(cp.parcel_n_ids, dtype=np.int32)
-        )
-        meta.write_text(json.dumps(cp.meta(), indent=2), encoding="utf-8")
+        arrays = {"parcel_n_ids": np.asarray(cp.parcel_n_ids, dtype=np.int32)}
+        if cp.last_change_iter is not None:
+            arrays["last_change_iter"] = np.asarray(
+                cp.last_change_iter, dtype=np.int64
+            )
+        # Write then rename, both files. A checkpoint truncated by a force-quit
+        # or a power cut would otherwise be indistinguishable from a good one
+        # and fail on load -- exactly when it is most needed.
+        # Temp names must (a) keep the .npz suffix, because np.savez_compressed
+        # silently appends ".npz" to anything that lacks it, and (b) not start
+        # with "checkpoint_", or the globs in list()/_prune() would pick up a
+        # half-written file as a real one.
+        npz_tmp = self.dir / f"_writing_{tag}.npz"
+        meta_tmp = self.dir / f"_writing_{tag}.json"
+        np.savez_compressed(npz_tmp, **arrays)
+        meta_tmp.write_text(json.dumps(cp.meta(), indent=2), encoding="utf-8")
+        # npz first: `list()` requires both files, so an interruption between the
+        # two renames simply hides the checkpoint rather than corrupting it.
+        os.replace(npz_tmp, npz)
+        os.replace(meta_tmp, meta)
         if not final:
             self._prune()
         return str(npz)
@@ -110,7 +149,8 @@ class CheckpointStore:
     def _prune(self) -> None:
         if self.keep <= 0:
             return
-        entries = [p for p in self.dir.glob("checkpoint_*.json") if "final" not in p.name]
+        entries = [p for p in self.dir.glob("checkpoint_*.json")
+                   if "final" not in p.name and p.suffix == ".json"]
         if len(entries) <= self.keep:
             return
         entries.sort(key=lambda p: _iteration_of(p))
@@ -141,6 +181,10 @@ class CheckpointStore:
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
         with np.load(meta_path.with_suffix(".npz")) as data:
             ids = data["parcel_n_ids"].astype(np.int64)
+            last_change = (
+                data["last_change_iter"].astype(np.int64)
+                if "last_change_iter" in data.files else None
+            )
         return Checkpoint(
             iteration=int(meta["iteration"]),
             temperature=float(meta["temperature"]),
@@ -151,6 +195,8 @@ class CheckpointStore:
             n_neighborhoods=int(meta.get("n_neighborhoods", int(ids.max()) + 1)),
             parcel_n_ids=ids,
             rng_state=_unjsonify(meta.get("rng_state")) or None,
+            last_change_iter=last_change,
+            assignment_stable_streak=int(meta.get("assignment_stable_streak", 0)),
             extra=meta.get("extra", {}),
         )
 

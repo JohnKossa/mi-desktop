@@ -211,6 +211,20 @@ class TiledOptimizer:
         self.boundary: set = set()
         self._rebuild_boundary()
 
+        # neighborhood id -> set of tile positions, for the contiguity gate.
+        self.n_to_tiles: Dict[int, set] = {}
+        self._rebuild_n_to_tiles()
+        if cfg.enforce_contiguity:
+            self._report_initial_connectivity()
+
+        # Per-parcel iteration of last label change, for the convergence test.
+        # Seeded to 0 so a fresh run reads as "everything just changed" and
+        # cannot exit before it has any history.
+        self.last_change_iter = np.zeros(len(self.parcel_n_ids), dtype=np.int64)
+        self._stable_streak = 0
+        self._last_batch = cfg.max_batch
+        self.blocked_batches = 0  # batches where every candidate broke contiguity
+
         self.iteration = 0
         self.temperature = float(cfg.initial_temp)
         self.stability_counter = 0
@@ -258,6 +272,108 @@ class TiledOptimizer:
 
     def _neighbors(self, i: int) -> np.ndarray:
         return self.adj_indices[self.adj_indptr[i] : self.adj_indptr[i + 1]]
+
+    # ------------------------------------------------------------------
+    # Contiguity
+    # ------------------------------------------------------------------
+
+    def _rebuild_n_to_tiles(self) -> None:
+        out: Dict[int, set] = {}
+        for pos in range(self.n_tiles):
+            out.setdefault(int(self.tile_n_ids[pos]), set()).add(pos)
+        self.n_to_tiles = out
+
+    def _components_of(self, tiles: set) -> int:
+        """Number of connected components in a set of tile positions."""
+        remaining = set(tiles)
+        count = 0
+        while remaining:
+            count += 1
+            stack = [remaining.pop()]
+            while stack:
+                cur = stack.pop()
+                for nb in self._neighbors(cur):
+                    nb = int(nb)
+                    if nb in remaining:
+                        remaining.discard(nb)
+                        stack.append(nb)
+        return count
+
+    def _report_initial_connectivity(self) -> None:
+        counts = {n: self._components_of(t) for n, t in self.n_to_tiles.items()}
+        broken = {n: c for n, c in counts.items() if c > 1}
+        total = sum(counts.values())
+        self.progress(
+            f"Contiguity: {len(counts):,} neighborhoods in {total:,} components; "
+            f"{len(broken):,} already disconnected."
+        )
+        if broken:
+            worst = sorted(broken.items(), key=lambda kv: -kv[1])[:5]
+            self.progress(
+                f"  Worst (id, components): {worst}. Pre-existing exclaves are "
+                "preserved -- the gate only prevents NEW disconnection."
+            )
+
+    def _removal_disconnects(self, n_id: int, tile: int) -> bool:
+        """Would removing ``tile`` from ``n_id`` split what's left of it?
+
+        A local articulation test: every tile of ``n_id`` adjacent to ``tile`` was
+        reachable through it, so if they are still mutually reachable without it,
+        nothing fragmented. Anything already disconnected elsewhere in the
+        neighborhood is untouched by this and stays that way.
+        """
+        owned = self.n_to_tiles.get(n_id)
+        if not owned:
+            return False
+        anchors = [int(n) for n in self._neighbors(tile) if int(n) in owned]
+        if len(anchors) <= 1:
+            return False
+
+        remaining = owned - {tile}
+        needed = set(anchors[1:])
+        visited = {anchors[0]}
+        queue = [anchors[0]]
+        while queue and needed:
+            cur = queue.pop()
+            for nb in self._neighbors(cur):
+                nb = int(nb)
+                if nb in remaining and nb not in visited:
+                    visited.add(nb)
+                    needed.discard(nb)
+                    if not needed:
+                        return False
+                    queue.append(nb)
+        return bool(needed)
+
+    def _addition_creates_island(self, n_id: int, leaving: int, arriving: int) -> bool:
+        """Would ``arriving`` land in ``n_id`` with no neighbour left in it?
+
+        Only swaps can do this: ``leaving`` may have been the arriving tile's only
+        anchor, and it departs in the same move. A donation always travels along a
+        boundary edge, so the recipient is adjacent by construction.
+        """
+        owned = self.n_to_tiles.get(n_id)
+        if not owned:
+            return True
+        for nb in self._neighbors(arriving):
+            nb = int(nb)
+            if nb != leaving and nb in owned:
+                return False
+        return True
+
+    def _move_breaks_contiguity(self, move: tuple) -> bool:
+        if not self.cfg.enforce_contiguity:
+            return False
+        if move[0] == "donation":
+            _, tile, n_donor, _n_recip, _s_d, _s_r = move
+            return self._removal_disconnects(n_donor, tile)
+        _, ti, tj, n_i, n_j, _s_i, _s_j = move
+        return (
+            self._removal_disconnects(n_i, ti)
+            or self._removal_disconnects(n_j, tj)
+            or self._addition_creates_island(n_i, ti, tj)
+            or self._addition_creates_island(n_j, tj, ti)
+        )
 
     def _touch_boundary(self, i: int) -> None:
         tn = self.tile_n_ids
@@ -321,6 +437,7 @@ class TiledOptimizer:
 
         self.scores = mi.all_scores(ct)
         self._rebuild_boundary()
+        self._rebuild_n_to_tiles()
         self._boundary_list = sorted(self.boundary)
         self.progress(f"Consolidation pass: {mixed:,} mixed tiles resolved")
         return mixed
@@ -367,7 +484,16 @@ class TiledOptimizer:
         return gain, ("swap", ti, tj, n_i, n_j, s_i, s_j)
 
     def _best_move(self, edges: Sequence[Tuple[int, int]]) -> Optional[tuple]:
-        best, best_gain = None, -np.inf
+        """Best *legal* move in this batch.
+
+        The contiguity gate is applied after ranking rather than to every
+        candidate. Filtering first and then taking the best is identical to
+        taking the best that passes, but the second form only gates until it
+        finds a legal move -- about 1.05 checks per iteration at the measured 5%
+        block rate, instead of one per candidate (~1,500, which cost 18 ms and
+        halved throughput).
+        """
+        candidates: List[tuple] = []
         for ti, tj in edges:
             if (ti, tj) not in self.boundary:
                 continue  # stale entry from a cached boundary list
@@ -375,29 +501,38 @@ class TiledOptimizer:
             if ti == tj:
                 # Mixed tile: consider every neighborhood it or its neighbours hold.
                 n_primary = int(self.tile_n_ids[ti])
-                candidates = set(
+                recipients = set(
                     int(v) for v in np.unique(self.parcel_n_ids[self.tile_parcels[ti]])
                 )
                 for j in self._neighbors(ti):
-                    candidates.add(int(self.tile_n_ids[int(j)]))
-                for n_recip in candidates:
+                    recipients.add(int(self.tile_n_ids[int(j)]))
+                for n_recip in recipients:
                     res = self._eval_donation(ti, n_primary, n_recip)
-                    if res and res[0] > best_gain:
-                        best_gain, best = res
+                    if res:
+                        candidates.append(res)
                 continue
 
             n_i, n_j = int(self.tile_n_ids[ti]), int(self.tile_n_ids[tj])
             for donor, n_donor, n_recip in ((ti, n_i, n_j), (tj, n_j, n_i)):
                 res = self._eval_donation(donor, n_donor, n_recip)
-                if res and res[0] > best_gain:
-                    best_gain, best = res
+                if res:
+                    candidates.append(res)
             res = self._eval_swap(ti, tj)
-            if res and res[0] > best_gain:
-                best_gain, best = res
+            if res:
+                candidates.append(res)
 
-        if best is None:
+        if not candidates:
             return None
-        return best_gain, best
+        # Sort on gain alone (not the whole tuple) so ties keep insertion order
+        # and the choice stays reproducible.
+        candidates.sort(key=lambda c: -c[0])
+        if not self.cfg.enforce_contiguity:
+            return candidates[0]
+        for gain, move in candidates:
+            if not self._move_breaks_contiguity(move):
+                return gain, move
+        self.blocked_batches += 1
+        return None
 
     # ------------------------------------------------------------------
     # Commit
@@ -412,7 +547,11 @@ class TiledOptimizer:
             num_p = len(pidx)
 
             self.parcel_n_ids[pidx] = n_recip
+            self.last_change_iter[pidx] = self.iteration
             self.tile_n_ids[tile] = n_recip
+            owned = self.n_to_tiles
+            owned.setdefault(n_donor, set()).discard(tile)
+            owned.setdefault(n_recip, set()).add(tile)
             mi.apply_delta(ct, n_donor, delta, None)
             mi.apply_delta(ct, n_recip, None, delta)
             ct.totals[n_donor] -= num_p
@@ -427,7 +566,14 @@ class TiledOptimizer:
 
             self.parcel_n_ids[p_i] = n_j
             self.parcel_n_ids[p_j] = n_i
+            self.last_change_iter[p_i] = self.iteration
+            self.last_change_iter[p_j] = self.iteration
             self.tile_n_ids[ti], self.tile_n_ids[tj] = n_j, n_i
+            owned = self.n_to_tiles
+            owned.setdefault(n_i, set()).discard(ti)
+            owned.setdefault(n_j, set()).add(ti)
+            owned.setdefault(n_j, set()).discard(tj)
+            owned.setdefault(n_i, set()).add(tj)
             mi.apply_delta(ct, n_i, d_i, d_j)
             mi.apply_delta(ct, n_j, d_j, d_i)
             ct.totals[n_i] = ct.totals[n_i] - num_i + num_j
@@ -440,23 +586,48 @@ class TiledOptimizer:
     # Main loop
     # ------------------------------------------------------------------
 
-    def stability_limit(self) -> int:
-        """Consecutive misses tolerated before declaring convergence.
+    def recent_change_fraction(self) -> float:
+        """Share of this optimizer's parcels relabelled in the last window."""
+        window = int(self.cfg.assignment_stability_iters)
+        owned = self._owned_parcels
+        if window <= 0 or not len(owned):
+            return 1.0
+        age = self.iteration - self.last_change_iter[owned]
+        return float(np.count_nonzero(age < window)) / len(owned)
 
-        With ``stability_sweeps > 0`` this becomes "that many complete sweeps of
-        my own boundary turned up nothing", which means the same thing whether
-        the boundary has 500 edges or 20,000. That matters once components are
-        annealed separately: a flat count is a far weaker convergence signal on a
-        large boundary (one batch of 256 samples ~1% of it) than on a small one
-        (where the same batch samples half), so identical thresholds would stop
-        big and small subproblems at very different depths.
+    def _assignment_converged(self) -> bool:
+        """True once the map has stopped changing, not merely stopped improving.
+
+        Annealing can keep accepting marginal moves forever without the
+        assignment actually moving, which is why a rejected-move count is a weak
+        signal. This asks the direct question, and because it is a *fraction of
+        my own parcels* it means the same thing for a 30-tile island as for a
+        15,000-tile mainland.
         """
         cfg = self.cfg
-        if cfg.stability_sweeps <= 0:
-            return int(cfg.max_stability)
-        batch = max(1, int(getattr(self, "_last_batch", cfg.max_batch)))
-        per_sweep = max(1, -(-len(self.boundary) // batch))  # ceil division
-        return max(int(cfg.max_stability), int(cfg.stability_sweeps * per_sweep))
+        if not cfg.assignment_stability_iters:
+            return False
+        # Needs a full window of history first, or the initial all-zero
+        # last_change_iter would read as "nothing changed recently".
+        if self.iteration < cfg.assignment_stability_iters:
+            self._stable_streak = 0
+            return False
+
+        frac = self.recent_change_fraction()
+        if frac >= cfg.assignment_stability_frac:
+            self._stable_streak = 0
+            return False
+
+        self._stable_streak += 1
+        if self._stable_streak < cfg.assignment_stability_streak:
+            return False
+        self.progress(
+            f"Converged: under {100 * cfg.assignment_stability_frac:.1f}% of "
+            f"parcels changed in {cfg.assignment_stability_streak} consecutive "
+            f"{cfg.assignment_stability_iters:,}-iteration windows "
+            f"(last {100 * frac:.3f}%)."
+        )
+        return True
 
     def owned_neighborhoods(self) -> np.ndarray:
         """Neighborhood ids this optimizer is responsible for.
@@ -581,19 +752,21 @@ class TiledOptimizer:
                 self.rejected += 1
                 if self.temperature < 0.001:
                     self.stability_counter += 1
-                    limit = self.stability_limit()
-                    if self.stability_counter >= limit:
+                    if self.stability_counter >= cfg.max_stability:
                         self.progress(
-                            f"Converged: no accepted moves in {limit:,} "
-                            f"iterations at T~0 (boundary {len(self.boundary):,})."
+                            f"Converged: no accepted moves in "
+                            f"{cfg.max_stability:,} iterations at T~0."
                         )
                         break
 
             self.iteration += 1
             self.temperature *= cfg.cooling_rate
 
-            if self.iteration % 100 == 0 and stats_cb:
-                stats_cb(self.stats(started=started))
+            if self.iteration % 100 == 0:
+                if stats_cb:
+                    stats_cb(self.stats(started=started))
+                if self._assignment_converged():
+                    break
 
             if snapshot_cb and self.iteration % max(cfg.refresh_every, 1) == 0:
                 if self.iteration != last_snapshot:
@@ -624,6 +797,8 @@ class TiledOptimizer:
             n_neighborhoods=self.n_neighborhoods,
             parcel_n_ids=self.parcel_n_ids,
             rng_state=self.rng.bit_generator.state,
+            last_change_iter=self.last_change_iter,
+            assignment_stable_streak=self._stable_streak,
         )
         path = store.save(cp, final=final)
         self.progress(f"Checkpoint saved: {path}")
@@ -650,8 +825,13 @@ class TiledOptimizer:
         self.scores = mi.all_scores(self.ct)
         self._recompute_tile_ids()
         self._rebuild_boundary()
+        self._rebuild_n_to_tiles()
         self._boundary_list = sorted(self.boundary)
         self._boundary_stamp = -1
+        # Never zeros: see Checkpoint.restore_last_change. A zeroed array would
+        # read as "nothing changed recently" and exit on the first check.
+        self.last_change_iter = cp.restore_last_change(len(self.parcel_n_ids))
+        self._stable_streak = int(cp.assignment_stable_streak)
 
         self.iteration = int(cp.iteration)
         self.temperature = float(cp.temperature)

@@ -101,17 +101,30 @@ class RunConfig:
     initial_temp: float = 1.0
     cooling_rate: float = 0.99
     max_iterations: int = 1_000_000
+    # Backstop: consecutive rejected batches at T~0 before giving up.
     max_stability: int = 1000
-    # A fixed miss count means different things at different scales. 1,000 misses
-    # against a 500-edge boundary is ~100 full sweeps of it; against a
-    # 20,000-edge boundary it is barely 12. When components are annealed
-    # separately those subproblems differ by orders of magnitude, so a flat
-    # threshold makes "converged" mean something different in each one.
+
+    # --- assignment-stability convergence ---------------------------------
+    # A rejected-move count is a poor convergence signal: it means different
+    # things on a 500-edge boundary than on a 20,000-edge one, and it never
+    # fires while simulated annealing keeps accepting marginal moves that don't
+    # actually change the map. Tracking how many parcels changed label recently
+    # is scale-free and measures the thing we care about directly.
     #
-    # Set > 0 to express the limit as "this many complete sweeps of my own
-    # boundary found nothing", which is scale-invariant. 0 keeps the original
-    # fixed-count behaviour exactly. Recommended for parallel runs.
-    stability_sweeps: float = 0.0
+    # Stop once fewer than `assignment_stability_frac` of this optimizer's own
+    # parcels changed label within the last `assignment_stability_iters`
+    # iterations, for `assignment_stability_streak` consecutive checks.
+    # Set assignment_stability_iters = 0 to disable.
+    assignment_stability_iters: int = 500
+    assignment_stability_frac: float = 0.01
+    assignment_stability_streak: int = 5
+
+    # --- contiguity -------------------------------------------------------
+    # Reject moves that would newly disconnect a neighborhood in the tile
+    # adjacency graph. Pre-existing disconnection is preserved, not repaired --
+    # the gate only prevents things getting worse. Changes results relative to
+    # runs made without it.
+    enforce_contiguity: bool = True
     batch_divisor: int = 10  # subsample = len(boundary) // batch_divisor
     max_batch: int = 256  # ...but never evaluate more than this many edges/iter
     min_batch: int = 8

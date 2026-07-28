@@ -8,7 +8,9 @@ thread whenever the optimizer emits a snapshot.
 
 from __future__ import annotations
 
+import os
 import sys
+import time
 import traceback
 from pathlib import Path
 from typing import Callable, List, Optional
@@ -876,48 +878,174 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # Shutdown
+    # ------------------------------------------------------------------
+
+    KEEP, GRACEFUL, FORCE = "keep", "graceful", "force"
+
+    def _ask_close(
+        self, title: str, text: str, detail: str, graceful_label: Optional[str] = None
+    ) -> str:
+        """Warn about work in flight, but never without an exit.
+
+        Advising someone against closing is fine; refusing to let them is not.
+        There is always an "Exit Anyway" button, and "Keep Running" is the
+        default so Enter/Escape do the safe thing.
+        """
+        box = QtWidgets.QMessageBox(self)
+        box.setIcon(QtWidgets.QMessageBox.Icon.Warning)
+        box.setWindowTitle(title)
+        box.setText(text)
+        box.setInformativeText(detail)
+
+        keep = box.addButton(
+            "Keep Running", QtWidgets.QMessageBox.ButtonRole.RejectRole
+        )
+        graceful = (
+            box.addButton(graceful_label, QtWidgets.QMessageBox.ButtonRole.AcceptRole)
+            if graceful_label else None
+        )
+        force = box.addButton(
+            "Exit Anyway", QtWidgets.QMessageBox.ButtonRole.DestructiveRole
+        )
+        box.setDefaultButton(keep)
+        box.setEscapeButton(keep)
+        box.exec()
+
+        clicked = box.clickedButton()
+        if clicked is force:
+            return self.FORCE
+        if graceful is not None and clicked is graceful:
+            return self.GRACEFUL
+        return self.KEEP
+
+    def _wait_for_stop(self, seconds: float) -> bool:
+        """Wait for the optimizer thread, keeping the UI painting.
+
+        A bare ``QThread.wait(60000)`` freezes the window for up to a minute,
+        which is indistinguishable from the hang the user was trying to escape.
+        """
+        deadline = time.monotonic() + seconds
+        app = QtWidgets.QApplication.instance()
+        while self.opt_thread and self.opt_thread.isRunning():
+            if time.monotonic() > deadline:
+                return False
+            self.opt_thread.wait(100)
+            if app is not None:
+                app.processEvents(
+                    QtCore.QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents
+                )
+        return True
+
+    def _force_quit(self) -> None:
+        """Leave now, whatever is in flight. Does not return."""
+        self.log("Force exit requested — abandoning work in progress.")
+        self.statusBar().showMessage("Exiting…")
+
+        # Worker processes first. os._exit skips atexit handlers, so spawned
+        # children would otherwise outlive the parent and keep burning CPU with
+        # no window to show for it.
+        runner = getattr(self.opt_thread, "runner", None)
+        if runner is not None:
+            try:
+                runner.stop()
+                runner.kill_workers()
+            except Exception:  # noqa: BLE001 - we are leaving regardless
+                pass
+        if self.prep is not None:
+            try:
+                self.prep.optimizer.pause_event.clear()
+                self.prep.optimizer.stop_event.set()
+            except Exception:  # noqa: BLE001
+                pass
+
+        # A short grace period in case a cooperative stop is about to land a
+        # checkpoint anyway; then go, without waiting on the uninterruptible
+        # geometry work that prompted this.
+        if self.opt_thread is not None and self.opt_thread.isRunning():
+            self._wait_for_stop(2.0)
+
+        for stream in (sys.stdout, sys.stderr):
+            try:
+                stream.flush()
+            except Exception:  # noqa: BLE001
+                pass
+        # Not event.accept(): destroying the window would take its still-running
+        # QThread children with it and abort, which on Windows means a crash
+        # dialog. _exit is the quiet door. Cache writes are atomic (see
+        # pipeline._atomic_write), so nothing on disk can be left half-written.
+        os._exit(0)
+
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # noqa: N802
-        if self.task and self.task.isRunning():
-            QtWidgets.QMessageBox.information(
-                self,
-                "Still preparing",
-                "Downloads and tiling are still in progress. Let them finish "
-                "before closing — the results are cached, so it only happens "
-                "once for this jurisdiction.",
-            )
+        if getattr(self, "_closing", False):
             event.ignore()
             return
 
-        if self.running():
-            answer = QtWidgets.QMessageBox.question(
-                self,
-                "Optimization running",
-                "Stop the run and save a final checkpoint before quitting?",
-                QtWidgets.QMessageBox.StandardButton.Yes
-                | QtWidgets.QMessageBox.StandardButton.Cancel,
-            )
-            if answer == QtWidgets.QMessageBox.StandardButton.Cancel:
-                event.ignore()
-                return
-            if self.prep:
-                self.prep.optimizer.pause_event.clear()
-                self.prep.optimizer.stop_event.set()
-            runner = getattr(self.opt_thread, "runner", None)
-            if runner is not None:
-                runner.set_paused(False)
-                runner.stop()
-            self.statusBar().showMessage("Stopping and checkpointing…")
-            if not self.opt_thread.wait(60000):
-                # Destroying the window now would take its QThread children with
-                # it and abort the process.
-                QtWidgets.QMessageBox.warning(
-                    self,
-                    "Still shutting down",
-                    "The optimizer hasn't stopped yet (it may be writing a "
-                    "large checkpoint). Try closing again in a moment.",
+        if self.task is not None and self.task.isRunning():
+            self._closing = True
+            try:
+                choice = self._ask_close(
+                    "Still preparing",
+                    "Downloads and tiling are still running.",
+                    "This only happens once per jurisdiction — the results are "
+                    "cached, so letting it finish saves repeating the work. "
+                    "Tiling a large county can take several minutes with no "
+                    "visible movement.\n\n"
+                    "Exiting now is safe: cache files are written atomically, so "
+                    "nothing on disk will be left corrupted. You will just have "
+                    "to redo the tiling next time.",
                 )
+            finally:
+                self._closing = False
+            if choice == self.KEEP:
                 event.ignore()
                 return
+            self._force_quit()  # does not return
+
+        if self.running():
+            self._closing = True
+            try:
+                choice = self._ask_close(
+                    "Optimization running",
+                    "The optimizer is still running.",
+                    "Stopping saves a final checkpoint, so you can resume exactly "
+                    "where you left off.\n\n"
+                    "Exiting immediately abandons any progress since the last "
+                    "checkpoint.",
+                    graceful_label="Stop && Save",
+                )
+            finally:
+                self._closing = False
+
+            if choice == self.KEEP:
+                event.ignore()
+                return
+            if choice == self.FORCE:
+                self._force_quit()  # does not return
+
+            # Graceful: ask it to stop, then wait a bounded while.
+            self.on_stop()
+            self.statusBar().showMessage("Stopping and saving a checkpoint…")
+            if not self._wait_for_stop(30.0):
+                followup = self._ask_close(
+                    "Still shutting down",
+                    "The optimizer hasn't stopped yet.",
+                    "It may be writing a large checkpoint, or be inside a long "
+                    "geometry operation that can't be interrupted.\n\n"
+                    "Give it longer, or exit now and lose progress since the "
+                    "last checkpoint.",
+                    graceful_label="Wait Longer",
+                )
+                if followup == self.FORCE:
+                    self._force_quit()  # does not return
+                if followup == self.GRACEFUL and self._wait_for_stop(60.0):
+                    pass
+                elif self.opt_thread is not None and self.opt_thread.isRunning():
+                    # Still going and they didn't ask to force: leaving the
+                    # window open beats aborting the process under them.
+                    event.ignore()
+                    return
         event.accept()
 
 

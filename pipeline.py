@@ -8,6 +8,7 @@ skips the downloads and the (expensive) shatter entirely.
 from __future__ import annotations
 
 import datetime as _dt
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -33,6 +34,41 @@ Progress = Callable[[str], None]
 
 def _noop(_: str) -> None:
     pass
+
+
+def _atomic_write(write, path: Path) -> Path:
+    """Run ``write(tmp)`` then rename into place.
+
+    Cache files have to be all-or-nothing. The app now offers a force-quit while
+    tiling is in flight, and a half-written ``tiles.parquet`` left on disk would
+    be picked up as a valid cache on the next run and fail to parse.
+    """
+    path = Path(path)
+    # The suffix has to come last: np.savez_compressed silently appends ".npz"
+    # to any filename that doesn't already end in it, so "x.npz.part" would be
+    # written as "x.npz.part.npz" and the rename below would miss it.
+    tmp = path.with_name(f"{path.stem}.part{path.suffix}")
+    tmp.unlink(missing_ok=True)
+    write(tmp)
+    if not tmp.exists():
+        raise OSError(f"{write!r} did not produce {tmp}")
+    os.replace(tmp, path)  # atomic on the same filesystem, Windows included
+    return path
+
+
+def _read_cached(read, path: Path, progress: Progress, what: str):
+    """Read a cache file, treating damage as "not cached" rather than fatal."""
+    try:
+        return read(path)
+    except Exception as exc:  # noqa: BLE001
+        progress(
+            f"Ignoring unreadable cached {what} ({exc}); it will be rebuilt."
+        )
+        try:
+            Path(path).unlink(missing_ok=True)
+        except OSError:
+            pass
+        return None
 
 
 def slugify(text: str) -> str:
@@ -261,7 +297,7 @@ def prepare(
         progress(f"Study area: {jurisdiction.label}")
         jur_gdf = jurisdiction.to_gdf()
         run_dir = Path(run_dir) if run_dir else create_run_dir(cfg, jurisdiction.label)
-        jur_gdf.to_parquet(run_dir / "jurisdiction.parquet")
+        _atomic_write(jur_gdf.to_parquet, run_dir / "jurisdiction.parquet")
 
     run_dir = Path(run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -275,10 +311,12 @@ def prepare(
 
     # ---- 3. tiles --------------------------------------------------------
     tiles_path = run_dir / "tiles.parquet"
+    tileset = None
     if use_cache and tiles_path.exists():
-        tileset = gpd.read_parquet(tiles_path)
-        progress(f"Reusing {len(tileset):,} tiles from {tiles_path.name}")
-    else:
+        tileset = _read_cached(gpd.read_parquet, tiles_path, progress, "tileset")
+        if tileset is not None:
+            progress(f"Reusing {len(tileset):,} tiles from {tiles_path.name}")
+    if tileset is None:
         if jurisdiction is None:
             jurisdiction = _jurisdiction_from_gdf(jur_gdf, cfg)
         blocks = (
@@ -305,7 +343,7 @@ def prepare(
             clip_water=cfg.clip_water,
             progress=progress,
         )
-        tileset.to_parquet(tiles_path)
+        _atomic_write(tileset.to_parquet, tiles_path)
 
     if tileset.crs != working_crs:
         tileset = tileset.to_crs(working_crs)
@@ -314,8 +352,12 @@ def prepare(
 
     # ---- 4. parcels ------------------------------------------------------
     prepared_path = run_dir / "parcels_prepared.parquet"
+    parcels = None
     if use_cache and prepared_path.exists():
-        parcels = gpd.read_parquet(prepared_path)
+        parcels = _read_cached(
+            gpd.read_parquet, prepared_path, progress, "prepared parcels"
+        )
+    if parcels is not None:
         progress(f"Reusing {len(parcels):,} prepared parcels")
         all_tiles = _tiles_for(parcels, tileset, working_crs)
         tile_to_parcels = {
@@ -329,7 +371,7 @@ def prepare(
         parcels, all_tiles, tile_to_parcels = tiles_mod.assign_parcels_to_tiles(
             parcels, tileset, progress=progress
         )
-        parcels.to_parquet(prepared_path)
+        _atomic_write(parcels.to_parquet, prepared_path)
 
     # ---- 5. adjacency ----------------------------------------------------
     populated = sorted(tile_to_parcels.keys())
@@ -355,7 +397,10 @@ def prepare(
             parcels, cfg.seed_fields, cfg.n_neighborhoods,
             random_state=cfg.random_seed, progress=progress,
         )
-        np.savez_compressed(seeded_path, neighborhood_id=seed_ids.astype(np.int32))
+        _atomic_write(
+            lambda p: np.savez_compressed(p, neighborhood_id=seed_ids.astype(np.int32)),
+            seeded_path,
+        )
 
     # ---- 6b. severed components -------------------------------------------
     comps = partition.find_components(tile_to_parcels, tile_adj, progress=progress)
@@ -375,8 +420,11 @@ def prepare(
             seed_ids, _ = partition.split_neighborhoods(
                 seed_ids, parcel_comp, progress=progress
             )
-            np.savez_compressed(
-                split_path, neighborhood_id=seed_ids.astype(np.int32)
+            _atomic_write(
+                lambda p: np.savez_compressed(
+                    p, neighborhood_id=seed_ids.astype(np.int32)
+                ),
+                split_path,
             )
         # An unsplit neighborhood spanning components is unfixable, and would
         # also make the parallel runner race on shared count-table rows.

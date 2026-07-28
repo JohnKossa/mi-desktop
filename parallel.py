@@ -188,6 +188,13 @@ def _worker(
             opt.stability_counter = int(resume.get("stability_counter", 0))
             opt.accepted = int(resume.get("accepted", 0))
             opt.rejected = int(resume.get("rejected", 0))
+            opt._stable_streak = int(resume.get("assignment_stable_streak", 0))
+            # Group state is scalars only, so the per-parcel change history isn't
+            # in it. Leaving the zeros from __init__ would make every parcel look
+            # `iteration` steps stale and trip instant false convergence, so fill
+            # with "everything just changed" instead -- same safe default as
+            # Checkpoint.restore_last_change.
+            opt.last_change_iter[:] = opt.iteration
         else:
             opt.consolidate_mixed_tiles()
 
@@ -292,6 +299,8 @@ class ParallelRunner:
         self._tile_pos = {int(t): i for i, t in enumerate(self.tile_ids)}
         self.tile_n_ids = np.zeros(len(self.tile_ids), dtype=np.int64)
         self._group_state: Dict[int, dict] = {}
+        # Kept so a force-quit can terminate them; see kill_workers().
+        self._procs: List = []
 
     # ------------------------------------------------------------------
 
@@ -334,6 +343,7 @@ class ParallelRunner:
             )
             p.start()
             procs.append(p)
+        self._procs = procs
 
         self.progress(
             f"Started {len(procs)} worker process(es) over "
@@ -447,6 +457,27 @@ class ParallelRunner:
 
     def stop(self) -> None:
         self.stop_event.set()
+
+    def kill_workers(self, grace_s: float = 1.0) -> None:
+        """Terminate the worker processes outright.
+
+        For force-quit only. Spawned children are not tied to the parent's
+        lifetime, so a parent that exits via ``os._exit`` (which skips atexit
+        handlers) would otherwise leave them running with no window attached.
+        """
+        self.stop_event.set()
+        deadline = time.time() + grace_s
+        for p in self._procs:
+            remaining = max(0.0, deadline - time.time())
+            if remaining:
+                p.join(timeout=remaining)
+        for p in self._procs:
+            if p.is_alive():
+                p.terminate()
+        for p in self._procs:
+            p.join(timeout=2)
+            if p.is_alive() and hasattr(p, "kill"):
+                p.kill()
 
     def set_paused(self, paused: bool) -> None:
         if paused:
