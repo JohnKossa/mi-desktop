@@ -176,6 +176,25 @@ def split_neighborhoods(
     return new_ids, split
 
 
+def any_spanning(
+    parcel_n_ids: np.ndarray, parcel_component: np.ndarray
+) -> bool:
+    """Fast predicate: does *any* neighborhood straddle a component?
+
+    ``spanning_neighborhoods`` builds a boolean mask per neighborhood, which is
+    O(neighborhoods x parcels) -- half a billion operations at county scale. This
+    answers the yes/no question with two ``np.unique`` passes, so it is cheap
+    enough to consult before every parallel run.
+    """
+    n_ids = np.asarray(parcel_n_ids, dtype=np.int64)
+    comp = np.asarray(parcel_component, dtype=np.int64)
+    if not len(n_ids):
+        return False
+    pairs = np.unique(np.stack([n_ids, comp], axis=1), axis=0)
+    _, counts = np.unique(pairs[:, 0], return_counts=True)
+    return bool((counts > 1).any())
+
+
 def spanning_neighborhoods(
     parcel_n_ids: np.ndarray, parcel_component: np.ndarray
 ) -> List[int]:

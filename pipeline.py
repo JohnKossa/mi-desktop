@@ -112,6 +112,9 @@ class PreparedRun:
     store: CheckpointStore
     components: Optional["partition.Components"] = None
     parcel_component: Optional[np.ndarray] = None
+    # True when some neighborhood straddles a severed component, which makes the
+    # parallel runner unsafe: two workers would write the same count-table rows.
+    neighborhoods_span_components: bool = False
     tile_to_parcels: Optional[Dict[int, np.ndarray]] = None
     tile_adjacency: Optional[Dict[int, set]] = None
 
@@ -121,8 +124,17 @@ class PreparedRun:
 
     # ------------------------------------------------------------------
     def worker_count(self) -> int:
-        """How many processes are worth starting for this tileset."""
+        """How many processes are worth starting for this tileset.
+
+        Forced to 1 if any neighborhood spans a severed component. The whole
+        no-shared-state argument for parallelism rests on neighborhoods being
+        confined to one component; without that, two workers write the same
+        count-table rows and the scores are quietly wrong. That is the case
+        whenever `split_severed_neighborhoods` is off.
+        """
         if self.components is None:
+            return 1
+        if self.neighborhoods_span_components:
             return 1
         return partition.useful_worker_count(
             self.components.parcel_counts, self.cfg.workers
@@ -135,6 +147,12 @@ class PreparedRun:
         if self.components is None or self.tile_to_parcels is None:
             raise RuntimeError("prepare() did not compute components")
 
+        if self.neighborhoods_span_components:
+            raise RuntimeError(
+                "Refusing to anneal in parallel: some neighborhood spans a "
+                "severed component, so workers would write the same count-table "
+                "rows. Enable split_severed_neighborhoods, or set workers = 1."
+            )
         n = self.worker_count()
         groups = partition.group_components(self.components.parcel_counts, n)
         progress(partition.describe_grouping(groups, self.components.parcel_counts))
@@ -435,6 +453,14 @@ def prepare(
                 "after splitting; refusing to continue."
             )
 
+    spans = partition.any_spanning(seed_ids, parcel_comp)
+    if spans and cfg.workers != 1:
+        progress(
+            "Some neighborhoods straddle severed components (splitting is off), "
+            "so parallel annealing would race on shared count-table rows. "
+            "Falling back to a single worker."
+        )
+
     # ---- 7. optimizer ----------------------------------------------------
     progress("Building count tables...")
     opt = engine.TiledOptimizer(
@@ -456,6 +482,7 @@ def prepare(
         store=store,
         components=comps,
         parcel_component=parcel_comp,
+        neighborhoods_span_components=spans,
         tile_to_parcels=tile_to_parcels,
         tile_adjacency=tile_adj,
     )

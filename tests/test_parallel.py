@@ -23,6 +23,7 @@ sys.path.insert(0, PROJECT)
 
 import engine  # noqa: E402
 import parallel  # noqa: E402
+import pipeline  # noqa: E402
 import partition  # noqa: E402
 import tiles as T  # noqa: E402
 from config import RunConfig  # noqa: E402
@@ -159,6 +160,57 @@ def test_useful_worker_count_clamps_to_available_speedup():
     # an explicit request is honoured but can't exceed the component count
     assert partition.useful_worker_count([100, 100], 8) == 2
     assert partition.useful_worker_count([100], 8) == 1
+
+
+def test_any_spanning_matches_the_slow_check_and_is_cheap():
+    cfg = base_config()
+    parcels, t2p, adj, seed = build(cfg)
+    comps = partition.find_components(t2p, adj)
+    pc = partition.parcel_components(comps, t2p, len(parcels))
+
+    assert partition.any_spanning(seed, pc) == bool(
+        partition.spanning_neighborhoods(seed, pc)
+    )
+    split, _ = partition.split_neighborhoods(seed, pc)
+    assert not partition.any_spanning(split, pc)
+    assert partition.any_spanning(np.zeros(len(parcels), dtype=np.int64), pc), (
+        "one neighborhood covering every island must count as spanning"
+    )
+
+
+def test_parallel_is_refused_when_neighborhoods_span_components():
+    """Splitting off + workers > 1 would race on shared count-table rows.
+
+    The no-shared-state argument rests entirely on neighborhoods being confined
+    to one component. Without that, two workers mutate the same rows of
+    neigh_counts and the scores are quietly wrong -- so it must be refused, not
+    attempted.
+    """
+    cfg = base_config(workers=4, split_severed_neighborhoods=False)
+    parcels, t2p, adj, seed = build(cfg)
+    comps = partition.find_components(t2p, adj)
+    pc = partition.parcel_components(comps, t2p, len(parcels))
+    assert partition.any_spanning(seed, pc), "fixture must have spanning hoods"
+
+    opt = engine.TiledOptimizer(parcels, t2p, adj, cfg, neighborhood_ids=seed)
+    prep = pipeline.PreparedRun(
+        cfg=cfg, run_dir=Path("."), jurisdiction_gdf=None, working_crs=CRS,
+        tiles=None, parcels=parcels, optimizer=opt, store=None,
+        components=comps, parcel_component=pc,
+        neighborhoods_span_components=True,
+        tile_to_parcels=t2p, tile_adjacency=adj,
+    )
+    assert prep.worker_count() == 1, "must fall back to a single worker"
+    try:
+        prep.make_parallel_runner()
+    except RuntimeError as exc:
+        assert "split_severed_neighborhoods" in str(exc), str(exc)
+    else:
+        raise AssertionError("expected make_parallel_runner to refuse")
+
+    # ...and with splitting on, parallelism is allowed again
+    prep.neighborhoods_span_components = False
+    assert prep.worker_count() > 1
 
 
 # ==========================================================================

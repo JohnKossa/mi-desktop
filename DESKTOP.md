@@ -170,6 +170,13 @@ gives each (neighborhood, component) pair its own id. Worth doing on its own
 merits; it also happens to be what makes the count-table rows disjoint per
 worker. Controlled by `split_severed_neighborhoods` (default on).
 
+**Turning it off disables parallel annealing, by design.** The no-shared-state
+argument rests entirely on neighborhoods being confined to one component; without
+that, two workers mutate the same rows of `neigh_counts` and the scores are
+quietly wrong. `PreparedRun.worker_count()` therefore forces 1 worker whenever
+any neighborhood spans a component, and `make_parallel_runner` refuses outright
+rather than racing.
+
 **Processes, not threads.** The inner loop is NumPy on ~150-element arrays plus
 Python set work on the boundary — squarely GIL-bound. Processes also give a
 cleaner story: after splitting there is no shared mutable state. Workers hold the
@@ -283,8 +290,47 @@ gate on : 6 -> 3     disconnected  6 -> 3
 gate off: 6 -> 76    disconnected  6 -> 44
 ```
 
-`enforce_contiguity` defaults on, which **changes results** relative to earlier
-runs.
+`enforce_contiguity` is a UI toggle ("Keep neighborhoods contiguous") and
+defaults on, which **changes results** relative to earlier runs.
+
+### Is there value in allowing exclaves?
+
+Measured on an ungated Lee County run — 806 exclaves, and the shape matters more
+than the count:
+
+| exclave size | count | parcels held |
+|---|---|---|
+| 1 parcel | 118 (14.6%) | 118 |
+| 2–5 | 216 (26.8%) | 694 |
+| 6–20 | 250 (31.0%) | 2,903 |
+| 21–100 | 180 (22.3%) | 7,916 |
+| 100+ | 42 (5.2%) | 6,982 |
+
+41% of exclaves are ≤5 parcels, but **80% of the stranded parcels sit in exclaves
+of 21+** (largest: 414 parcels). Two distinct phenomena: splinter noise, and
+substantial secondary pockets.
+
+That matters because the objective is mutual information between label and parcel
+characteristics — a statistical criterion with no opinion about geography. Two
+1990s golf-course pockets on opposite sides of the county may be one valuation
+stratum in every respect that the score can see. Against that sits
+defensibility, which is a professional judgement rather than a technical one.
+
+Two caveats worth carrying into that decision:
+
+- **Some "exclaves" are artifacts of the 100 ft adjacency threshold**, not real
+  discontiguity — the two banks of a Cape Coral canal are obviously one
+  neighborhood to a human but severed in the graph. The fix for those is the
+  adjacency definition, not permitting exclaves in general.
+- **The toggle only governs NEW disconnection either way.** 753 of 1,518
+  neighborhoods arrive already disconnected from KMeans seeding (fragmented
+  *within* a component, which `split_severed_neighborhoods` doesn't address), and
+  the gate preserves them. So "on" does not currently mean "contiguous"; it means
+  "no worse than the seed."
+
+A size threshold would separate the splinters from the real pockets, and would
+also recover most of the gate's 25% penalty since the blocks concentrate on tiny
+neighborhoods. Not implemented — left as a deliberate open question.
 
 ## Assignment-stability convergence
 

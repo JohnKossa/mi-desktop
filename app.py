@@ -383,6 +383,22 @@ class MainWindow(QtWidgets.QMainWindow):
             "structure actually allows."
         )
 
+        self.contiguity_chk = QtWidgets.QCheckBox("Keep neighborhoods contiguous")
+        self.contiguity_chk.setChecked(self.cfg.enforce_contiguity)
+        self.contiguity_chk.setToolTip(
+            "Reject any move that would split a neighborhood into disconnected "
+            "pieces (enforce_contiguity).\n\n"
+            "On: boundaries stay mappable, at a measured cost of roughly a "
+            "quarter of the score improvement — the best-scoring move is often "
+            "exactly the one that would carve a neighborhood.\n\n"
+            "Off: neighborhoods may form exclaves. On Lee County that produced "
+            "806 of them; about 40% were splinters of 5 parcels or fewer, but "
+            "80% of the affected parcels sat in exclaves of 21+, which can be "
+            "genuine submarkets.\n\n"
+            "Either way this only prevents NEW disconnection. Neighborhoods that "
+            "arrive disconnected from the KMeans seeding stay that way."
+        )
+
         self.split_chk = QtWidgets.QCheckBox("Split severed neighborhoods")
         self.split_chk.setChecked(self.cfg.split_severed_neighborhoods)
         self.split_chk.setToolTip(
@@ -414,6 +430,7 @@ class MainWindow(QtWidgets.QMainWindow):
         form.addWidget(QtWidgets.QLabel("Workers"), 3, 0)
         form.addWidget(self.workers_spin, 3, 1)
         form.addWidget(self.split_chk, 3, 2, 1, 2)
+        form.addWidget(self.contiguity_chk, 4, 0, 1, 4)
         v.addLayout(form)
 
         self.weights_table = WeightsTable()
@@ -546,6 +563,7 @@ class MainWindow(QtWidgets.QMainWindow):
         cfg.checkpoint_every = int(self.ckpt_spin.value())
         cfg.workers = int(self.workers_spin.value())
         cfg.split_severed_neighborhoods = self.split_chk.isChecked()
+        cfg.enforce_contiguity = self.contiguity_chk.isChecked()
         cfg.weights = self.weights_table.weights()
         return cfg
 
@@ -567,6 +585,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ckpt_spin.setValue(cfg.checkpoint_every)
         self.workers_spin.setValue(cfg.workers)
         self.split_chk.setChecked(cfg.split_severed_neighborhoods)
+        self.contiguity_chk.setChecked(cfg.enforce_contiguity)
         self.weights_table.set_weights(cfg.weights)
 
     # ------------------------------------------------------------------
