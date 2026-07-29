@@ -116,6 +116,63 @@ def test_summary_reports_without_an_assignment():
     assert "neighborhoods" not in text     # nothing to say without an assignment
 
 
+def test_crossing_style_shortens_gaps_and_leaves_touching_alone():
+    """A 500 ft bridge should draw as the 40 ft it actually spans."""
+    geoms, ids = _lattice(3, 100.0, gap=40.0)
+    adj = _all_pairs_within(geoms, 50.0)
+    d = diagnostics.analyse(geoms, adj, ids)
+
+    nodes = d.segments()
+    crossing = d.segments(at_crossing=True)
+    length = lambda s: np.hypot(*(s[:, 1, :] - s[:, 0, :]).T)  # noqa: E731
+
+    gap = d.edge_class == diagnostics.GAP
+    assert np.allclose(length(nodes)[gap], 140.0)      # centre to centre
+    assert np.allclose(length(crossing)[gap], 40.0)    # the gap itself
+
+    # And with no gaps at all, the two styles are identical.
+    touching, tids = _lattice(3, 100.0, gap=0.0)
+    dt = diagnostics.analyse(touching, _all_pairs_within(touching, 1.0), tids)
+    assert np.allclose(dt.segments(), dt.segments(at_crossing=True))
+
+
+def test_neighbors_of_finds_edges_from_both_sides():
+    """The centre of a 3x3 touches all eight others: 4 borders, 4 corners."""
+    geoms, ids = _lattice(3, 100.0, gap=0.0)
+    d = diagnostics.analyse(geoms, _all_pairs_within(geoms, 1.0), ids)
+
+    centre = 4  # (row 1, col 1)
+    others, classes, gaps = d.neighbors_of(centre)
+    assert sorted(others) == [0, 1, 2, 3, 5, 6, 7, 8]
+    assert int((classes == diagnostics.ROOK).sum()) == 4
+    assert int((classes == diagnostics.CORNER).sum()) == 4
+    assert np.allclose(gaps, 0.0)
+    # The graph is stored one way round, so a corner tile must still find all
+    # of its edges regardless of which side of the pair it sits on.
+    assert len(d.neighbors_of(0)[0]) == 3
+
+
+def test_edges_touching_matches_the_neighbour_count():
+    geoms, ids = _lattice(3, 100.0, gap=0.0)
+    d = diagnostics.analyse(geoms, _all_pairs_within(geoms, 1.0), ids)
+    for pos in range(len(ids)):
+        assert int(d.edges_touching(pos).sum()) == len(d.neighbors_of(pos)[0])
+
+
+def test_areas_are_recorded():
+    geoms, ids = _lattice(2, 100.0, gap=0.0)
+    d = diagnostics.analyse(geoms, _all_pairs_within(geoms, 1.0), ids)
+    assert np.allclose(d.areas, 10_000.0)
+
+
+def test_dimmed_moves_toward_white_without_overshooting():
+    colors = np.array([[0.0, 0.0, 0.0], [1.0, 1.0, 1.0], [0.2, 0.4, 0.6]])
+    out = render.dimmed(colors, 0.5)
+    assert np.allclose(out[0], 0.5)
+    assert np.allclose(out[1], 1.0)      # white stays white
+    assert (out <= 1.0).all() and (out >= colors).all()
+
+
 def test_edge_rgba_hides_unselected_classes():
     cls = np.array([diagnostics.ROOK, diagnostics.CORNER, diagnostics.GAP])
     visible = np.array([False, True, True])

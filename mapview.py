@@ -12,13 +12,14 @@ This module requires Qt. The colour/geometry helpers it uses live in
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Callable, Optional
 
 import matplotlib
 
 matplotlib.use("QtAgg")
 
 import numpy as np  # noqa: E402
+from PySide6 import QtCore  # noqa: E402
 from matplotlib.backends.backend_qtagg import (  # noqa: E402
     FigureCanvasQTAgg,
     NavigationToolbar2QT,
@@ -28,7 +29,7 @@ from matplotlib.figure import Figure  # noqa: E402
 
 from render import build_polygons, neighborhood_colors  # noqa: E402
 
-__all__ = ["MapCanvas", "make_toolbar", "neighborhood_colors"]
+__all__ = ["MapCanvas", "DiagnosticCanvas", "make_toolbar", "neighborhood_colors"]
 
 
 class MapCanvas(FigureCanvasQTAgg):
@@ -165,6 +166,158 @@ class MapCanvas(FigureCanvasQTAgg):
     # ------------------------------------------------------------------
     def save_png(self, path: str, dpi: int = 200) -> None:
         self.fig.savefig(path, dpi=dpi, bbox_inches="tight")
+
+
+class DiagnosticCanvas(MapCanvas):
+    """A MapCanvas with the extras the tile-diagnostics tab needs.
+
+    Kept apart from ``MapCanvas`` so the live optimization map -- which repaints
+    every few hundred iterations and wants to stay as cheap as possible -- does
+    not carry any of this.
+
+    Three overlays sit on top of the tiles (borders, node dots, and the faint
+    underlay of tiles the optimizer does not own), and all three are useless
+    when the whole county is in view: 64,000 outlined tiles render as a solid
+    dark mass. So each is *requested* by the caller and *granted* by
+    ``_apply_density``, which counts what is actually on screen after every pan
+    or zoom and withholds the overlay until it would be readable.
+    """
+
+    #: More visible tiles than this and the overlays are noise, not information.
+    DENSITY_LIMIT = 4000
+    #: Pan/zoom fires xlim_changed continuously; recount only once it settles.
+    SETTLE_MS = 120
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.nodes = None
+        self.underlay: Optional[PolyCollection] = None
+        self.points: Optional[np.ndarray] = None
+
+        self._want = {"borders": False, "nodes": False, "underlay": False}
+        self._granted = dict(self._want)
+        self._visible_tiles = 0
+        self.on_density_change: Optional[Callable[[int, dict], None]] = None
+        self.on_tile_clicked: Optional[Callable[[Optional[int]], None]] = None
+
+        self._settle = QtCore.QTimer(self)
+        self._settle.setSingleShot(True)
+        self._settle.setInterval(self.SETTLE_MS)
+        self._settle.timeout.connect(self._apply_density)
+        self.ax.callbacks.connect("xlim_changed", self._on_limits_changed)
+        self.mpl_connect("button_press_event", self._on_click)
+
+    # ------------------------------------------------------------------
+    def set_tiles(self, geometries, simplify_tolerance=10.0, boundary=None) -> None:
+        # ax.clear() in the base drops every artist, so forget them all here
+        # rather than leaving dangling references that would fail to remove().
+        self.nodes = None
+        self.underlay = None
+        super().set_tiles(geometries, simplify_tolerance, boundary)
+
+    def set_nodes(self, points: np.ndarray) -> None:
+        """One dot per tile, at the exact point the edges are drawn from."""
+        self.points = np.asarray(points, dtype=np.float64)
+        if self.nodes is not None:
+            self.nodes.remove()
+            self.nodes = None
+        if not len(self.points):
+            return
+        self.nodes = self.ax.scatter(
+            self.points[:, 0], self.points[:, 1],
+            s=3.0, c="#222222", marker="o", linewidths=0, zorder=7,
+        )
+        self.nodes.set_visible(False)
+        self._apply_density()
+
+    def set_underlay(self, geometries, simplify_tolerance: float = 10.0) -> None:
+        """Tiles that exist but hold no modeled parcel, drawn beneath the rest.
+
+        These are what the gap-bridging edges hop over, and without them a gap
+        in the map is indistinguishable from a road, a lake, or the edge of the
+        study area.
+        """
+        if self.underlay is not None:
+            self.underlay.remove()
+            self.underlay = None
+        verts, _ = build_polygons(geometries, simplify_tolerance)
+        if not verts:
+            self.draw_idle()
+            return
+        self.underlay = PolyCollection(
+            verts, closed=True, facecolors="#f2ede3", edgecolors="#d8cdb8",
+            linewidths=0.25, antialiaseds=False, zorder=0,
+        )
+        self.underlay.set_visible(False)
+        self.ax.add_collection(self.underlay)
+        self._apply_density()
+
+    # ------------------------------------------------------------------
+    def request(self, **wanted: bool) -> None:
+        """Ask for overlays. Density decides whether they are actually shown."""
+        self._want.update({k: bool(v) for k, v in wanted.items() if k in self._want})
+        self._apply_density()
+
+    def _on_limits_changed(self, _ax) -> None:
+        self._settle.start()
+
+    def _apply_density(self) -> None:
+        """Grant each requested overlay only if the view is sparse enough."""
+        self._visible_tiles = self._count_visible()
+        sparse = self._visible_tiles <= self.DENSITY_LIMIT
+        granted = {k: (v and sparse) for k, v in self._want.items()}
+
+        if self.collection is not None:
+            if granted["borders"]:
+                self.collection.set_linewidths(0.3)
+                self.collection.set_edgecolors((0.25, 0.25, 0.25, 0.85))
+            else:
+                self.collection.set_linewidths(0.0)
+                self.collection.set_edgecolors("none")
+        if self.nodes is not None:
+            self.nodes.set_visible(granted["nodes"])
+        if self.underlay is not None:
+            self.underlay.set_visible(granted["underlay"])
+
+        self._granted = granted
+        if self.on_density_change is not None:
+            self.on_density_change(self._visible_tiles, dict(granted))
+        self.draw_idle()
+
+    def _count_visible(self) -> int:
+        """Tiles whose node lies in the current view.
+
+        Counting points rather than querying polygon geometry keeps this to one
+        NumPy pass, which matters because it runs after every zoom.
+        """
+        if self.points is None or not len(self.points):
+            return 0
+        x0, x1 = sorted(self.ax.get_xlim())
+        y0, y1 = sorted(self.ax.get_ylim())
+        px, py = self.points[:, 0], self.points[:, 1]
+        return int(np.count_nonzero((px >= x0) & (px <= x1) & (py >= y0) & (py <= y1)))
+
+    @property
+    def suppressed(self) -> bool:
+        return any(self._want[k] and not self._granted[k] for k in self._want)
+
+    @property
+    def visible_tiles(self) -> int:
+        return self._visible_tiles
+
+    # ------------------------------------------------------------------
+    def _on_click(self, event) -> None:
+        # Only a plain left click in the axes selects. While the toolbar is in
+        # pan or zoom mode the drag belongs to it, not to us.
+        if self.on_tile_clicked is None or event.inaxes is not self.ax:
+            return
+        if event.button != 1:
+            return
+        if getattr(getattr(self, "toolbar", None), "mode", ""):
+            return
+        if event.xdata is None or event.ydata is None:
+            return
+        self.on_tile_clicked((float(event.xdata), float(event.ydata)))
 
 
 def make_toolbar(canvas: MapCanvas, parent=None) -> NavigationToolbar2QT:

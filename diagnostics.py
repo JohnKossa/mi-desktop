@@ -125,6 +125,8 @@ class TileDiagnostics:
     edge_class: np.ndarray      # (E,) ROOK / CORNER / GAP
     gap_ft: np.ndarray          # (E,) 0.0 where the tiles touch
     points: np.ndarray          # (N, 2) a point inside each tile, for drawing
+    crossings: np.ndarray       # (E, 2, 2) where a gap edge actually spans
+    areas: np.ndarray           # (N,) tile area, sq ft
     seconds: float = 0.0
 
     @property
@@ -138,9 +140,44 @@ class TileDiagnostics:
     def class_mask(self, *classes: int) -> np.ndarray:
         return np.isin(self.edge_class, np.asarray(classes, dtype=np.int8))
 
-    def segments(self) -> np.ndarray:
-        """(E, 2, 2) line segments joining each edge's two tiles."""
-        return np.stack([self.points[self.left], self.points[self.right]], axis=1)
+    def segments(self, at_crossing: bool = False) -> np.ndarray:
+        """(E, 2, 2) line segments for drawing the graph.
+
+        Node-to-node by default, which reads as a graph: every edge visibly
+        terminates in a tile. ``at_crossing`` instead draws each *gap* edge as
+        the short segment that actually spans its gap. A gap bridge can be
+        thousands of feet long, and drawn node-to-node it sprawls across every
+        tile in between, so the crossing form is far quieter -- at the cost of
+        no longer showing you which two tiles it joins.
+
+        Touching edges are node-to-node either way: their crossing is a
+        zero-length point, which would draw as nothing.
+        """
+        nodes = np.stack([self.points[self.left], self.points[self.right]], axis=1)
+        if not at_crossing:
+            return nodes
+        out = nodes.copy()
+        gaps = self.edge_class == GAP
+        out[gaps] = self.crossings[gaps]
+        return out
+
+    def neighbors_of(self, pos: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """(neighbour positions, edge class, gap ft) for one tile.
+
+        The graph is stored as undirected pairs, so a tile shows up on either
+        side of its own edges and both have to be gathered.
+        """
+        as_left = self.left == pos
+        as_right = self.right == pos
+        others = np.concatenate([self.right[as_left], self.left[as_right]])
+        classes = np.concatenate([self.edge_class[as_left], self.edge_class[as_right]])
+        gaps = np.concatenate([self.gap_ft[as_left], self.gap_ft[as_right]])
+        order = np.argsort(classes, kind="stable")
+        return others[order], classes[order], gaps[order]
+
+    def edges_touching(self, pos: int) -> np.ndarray:
+        """Boolean mask of the edges incident to one tile."""
+        return (self.left == pos) | (self.right == pos)
 
     # ------------------------------------------------------------------
     def components(
@@ -273,6 +310,15 @@ def analyse(
     # there points at nothing.
     points = shapely.get_coordinates(shapely.point_on_surface(geoms))
 
+    # Where each gap edge physically spans, for the decluttered edge style.
+    # Touching edges keep their node-to-node segment (their crossing is a point).
+    crossings = np.stack([points[left], points[right]], axis=1)
+    gap_idx = np.where(edge_class == GAP)[0]
+    if len(gap_idx):
+        progress(f"Diagnostics: locating {len(gap_idx):,} gap crossings...")
+        lines = shapely.shortest_line(geoms[left[gap_idx]], geoms[right[gap_idx]])
+        crossings[gap_idx] = shapely.get_coordinates(lines).reshape(-1, 2, 2)
+
     result = TileDiagnostics(
         tile_ids=tile_ids,
         left=left,
@@ -280,6 +326,8 @@ def analyse(
         edge_class=edge_class,
         gap_ft=gap_ft,
         points=points,
+        crossings=crossings,
+        areas=shapely.area(geoms),
         seconds=time.time() - started,
     )
     progress(f"Diagnostics: done in {result.seconds:.1f}s")

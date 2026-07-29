@@ -47,6 +47,12 @@ def flat_fill(n: int, color=IDLE_FILL) -> np.ndarray:
     return np.tile(np.asarray(color, dtype=np.float64), (max(n, 0), 1))
 
 
+def dimmed(colors: np.ndarray, amount: float = 0.72) -> np.ndarray:
+    """Wash colours out toward white, so a highlight on top reads clearly."""
+    colors = np.asarray(colors, dtype=np.float64)
+    return colors + (1.0 - colors) * float(amount)
+
+
 def edge_rgba(
     edge_class: np.ndarray,
     class_colors,

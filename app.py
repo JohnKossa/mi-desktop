@@ -32,7 +32,7 @@ from config import (
     runs_dir,
 )
 from engine import OptimizerStats
-from mapview import MapCanvas, make_toolbar, neighborhood_colors
+from mapview import DiagnosticCanvas, MapCanvas, make_toolbar, neighborhood_colors
 from sources import Jurisdiction
 
 
@@ -394,15 +394,58 @@ class MainWindow(QtWidgets.QMainWindow):
             box.stateChanged.connect(self._redraw_diagnostics)
             self.diag_class_boxes.append(box)
             row2.addWidget(box)
+
+        self.diag_crossing = QtWidgets.QCheckBox("draw at crossing")
+        self.diag_crossing.setToolTip(
+            "Draw a gap-bridging edge as the short segment that actually spans "
+            "its gap, instead of a line between the two tiles' centres.\n"
+            "Much quieter -- a long bridge otherwise sprawls across every tile "
+            "in between -- but it no longer shows which two tiles it joins."
+        )
+        self.diag_crossing.stateChanged.connect(self._on_edge_style_changed)
+        row2.addWidget(self.diag_crossing)
         row2.addStretch(1)
         v.addLayout(row2)
+
+        # ---- tile overlays ----
+        row3 = QtWidgets.QHBoxLayout()
+        row3.addWidget(QtWidgets.QLabel("Show tiles:"))
+        self.diag_borders = QtWidgets.QCheckBox("borders")
+        self.diag_borders.setChecked(True)
+        self.diag_borders.setToolTip(
+            "Outline every tile. Without this, adjacent tiles of the same "
+            "colour merge into one shape."
+        )
+        self.diag_nodes = QtWidgets.QCheckBox("centres")
+        self.diag_nodes.setToolTip(
+            "A dot where each tile's edges are drawn from, so the graph's nodes "
+            "are visible and not just its lines."
+        )
+        self.diag_underlay = QtWidgets.QCheckBox("unpopulated")
+        self.diag_underlay.setToolTip(
+            "Tiles that exist but hold no modeled parcel -- what the "
+            "gap-bridging edges are hopping over. Loaded on first use."
+        )
+        for box in (self.diag_borders, self.diag_nodes):
+            box.stateChanged.connect(self._on_overlays_changed)
+        self.diag_underlay.stateChanged.connect(self._on_underlay_toggled)
+        row3.addWidget(self.diag_borders)
+        row3.addWidget(self.diag_nodes)
+        row3.addWidget(self.diag_underlay)
+
+        self.diag_hint = QtWidgets.QLabel("")
+        self.diag_hint.setStyleSheet("color: #888; font-size: 10px;")
+        row3.addWidget(self.diag_hint, 1)
+        v.addLayout(row3)
 
         # ---- canvas + report ----
         split = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
         holder = QtWidgets.QWidget()
         hv = QtWidgets.QVBoxLayout(holder)
         hv.setContentsMargins(0, 0, 0, 0)
-        self.diag_canvas = MapCanvas()
+        self.diag_canvas = DiagnosticCanvas()
+        self.diag_canvas.on_density_change = self._on_diag_density
+        self.diag_canvas.on_tile_clicked = self._on_tile_clicked
         hv.addWidget(make_toolbar(self.diag_canvas, self))
         hv.addWidget(self.diag_canvas, 1)
         split.addWidget(holder)
@@ -424,7 +467,8 @@ class MainWindow(QtWidgets.QMainWindow):
             "  gap bridged    they never touch; only the adjacency threshold "
             "joins them.\n\n"
             "enforce_contiguity and the severed-component split both consult this "
-            "same graph, so\nanything it calls connected is invisible to them."
+            "same graph, so\nanything it calls connected is invisible to them.\n\n"
+            "Once analysed, click any tile to see what it is joined to and how."
         )
         split.addWidget(self.diag_report)
         split.setStretchFactor(0, 1)
@@ -433,6 +477,13 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.diag: Optional[diagnostics.TileDiagnostics] = None
         self.diag_tile_n_ids: Optional[np.ndarray] = None
+        self.diag_selected: Optional[int] = None
+        self._diag_tree = None            # STRtree over the tiles, for clicks
+        self._diag_base_colors: Optional[np.ndarray] = None
+        self._diag_base_title = ""
+        self._diag_base_visible: Optional[np.ndarray] = None
+        self._diag_summary = ""
+        self._diag_unpopulated_loaded = False
         return page
 
     # ---------------- boxes ----------------
@@ -1160,6 +1211,10 @@ class MainWindow(QtWidgets.QMainWindow):
         # one.
         self.diag = None
         self.diag_tile_n_ids = None
+        self.diag_selected = None
+        self._diag_tree = None
+        self._diag_base_colors = None
+        self._diag_summary = ""
         self.diag_view.setEnabled(False)
         self.diag_refresh.setEnabled(False)
         self.diag_canvas.clear_edges()
@@ -1286,7 +1341,17 @@ class MainWindow(QtWidgets.QMainWindow):
             simplify_tolerance=max(prep.cfg.grid_size_ft / 50.0, 1.0),
             boundary=prep.jurisdiction_gdf.to_crs(prep.working_crs),
         )
-        self.diag_canvas.set_edges(diag.segments())
+        self.diag_canvas.set_edges(diag.segments(self.diag_crossing.isChecked()))
+        self.diag_canvas.set_nodes(diag.points)
+        self._diag_tree = None
+        self.diag_selected = None
+        self._diag_unpopulated_loaded = False
+        if self.diag_underlay.isChecked():
+            # A new tileset invalidates whatever underlay was loaded before.
+            self.diag_underlay.blockSignals(True)
+            self.diag_underlay.setChecked(False)
+            self.diag_underlay.blockSignals(False)
+        self._on_overlays_changed()
         # Via the view handler, not straight to the redraw, so the current view
         # gets its intended class defaults on first paint as well as on a change.
         self._on_diag_view_changed()
@@ -1308,6 +1373,108 @@ class MainWindow(QtWidgets.QMainWindow):
         self.diag_tile_n_ids = np.asarray(tn).copy()
         self._redraw_diagnostics()
         self._write_diag_report()
+
+    def _on_overlays_changed(self, *_) -> None:
+        self.diag_canvas.request(
+            borders=self.diag_borders.isChecked(),
+            nodes=self.diag_nodes.isChecked(),
+            underlay=self.diag_underlay.isChecked(),
+        )
+
+    def _on_edge_style_changed(self, *_) -> None:
+        if self.diag is None:
+            return
+        self.diag_canvas.set_edges(
+            self.diag.segments(self.diag_crossing.isChecked())
+        )
+        self._redraw_diagnostics()
+
+    def _on_diag_density(self, visible: int, granted: dict) -> None:
+        """Explain a withheld overlay rather than letting it look broken."""
+        held = [k for k, ok in granted.items() if not ok and self._overlay_wanted(k)]
+        if held:
+            self.diag_hint.setText(
+                f"{', '.join(held)} hidden — {visible:,} tiles in view "
+                f"(limit {self.diag_canvas.DENSITY_LIMIT:,}); zoom in"
+            )
+        else:
+            self.diag_hint.setText(f"{visible:,} tiles in view")
+
+    def _overlay_wanted(self, key: str) -> bool:
+        return {
+            "borders": self.diag_borders.isChecked(),
+            "nodes": self.diag_nodes.isChecked(),
+            "underlay": self.diag_underlay.isChecked(),
+        }.get(key, False)
+
+    # ------------------------------------------------------------------
+
+    def _on_underlay_toggled(self, *_) -> None:
+        """Load the unpopulated tiles the first time they are asked for.
+
+        They are not part of the prepared run -- the optimizer discards every
+        tile without a modeled parcel -- so they have to be re-read from the run
+        directory, and at county scale that is several hundred thousand
+        polygons. Done once, on a worker thread, and only on demand.
+        """
+        if not self.diag_underlay.isChecked() or self._diag_unpopulated_loaded:
+            self._on_overlays_changed()
+            return
+        if not self.prep:
+            return
+        if self.task is not None and self.task.isRunning():
+            self.diag_underlay.blockSignals(True)
+            self.diag_underlay.setChecked(False)
+            self.diag_underlay.blockSignals(False)
+            QtWidgets.QMessageBox.information(
+                self, "Busy", "Something else is still working; try again in a moment."
+            )
+            return
+
+        prep = self.prep
+        path = Path(prep.run_dir) / "tiles.parquet"
+        if not path.exists():
+            self.diag_underlay.setEnabled(False)
+            self.log(f"No {path.name} in the run directory; cannot show "
+                     "unpopulated tiles.")
+            return
+        owned = set(int(t) for t in prep.tiles.index)
+        crs = prep.working_crs
+
+        self.busy(True, "Loading unpopulated tiles…")
+
+        def work(log):
+            import geopandas as gpd
+
+            full = gpd.read_parquet(path).reset_index(drop=True)
+            log(f"Tileset has {len(full):,} tiles; "
+                f"{len(owned):,} carry modeled parcels")
+            rest = full.loc[[i for i in full.index if int(i) not in owned]]
+            if rest.crs is not None and rest.crs != crs:
+                rest = rest.to_crs(crs)
+            log(f"Underlay: {len(rest):,} unpopulated tiles")
+            return rest.geometry
+
+        self.task = Task(work, self)
+        self.task.log.connect(self.log)
+        self.task.failed.connect(self._on_underlay_failed)
+        self.task.done.connect(self._on_underlay_ready)
+        self.task.start()
+
+    def _on_underlay_failed(self, tb: str) -> None:
+        self.diag_underlay.blockSignals(True)
+        self.diag_underlay.setChecked(False)
+        self.diag_underlay.blockSignals(False)
+        self.on_failed(tb)
+
+    def _on_underlay_ready(self, geoms) -> None:
+        self.busy(False, "Underlay ready")
+        self._diag_unpopulated_loaded = True
+        tol = max(self.prep.cfg.grid_size_ft / 50.0, 1.0) if self.prep else 10.0
+        self.diag_canvas.set_underlay(geoms, simplify_tolerance=tol)
+        self._on_overlays_changed()
+
+    # ------------------------------------------------------------------
 
     def _on_diag_view_changed(self, *_) -> None:
         # "Adjacency edges by kind" is about the fabric, so it wants every class
@@ -1349,7 +1516,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 f"{int(weak.sum()):,} tiles have no shared border with their "
                 "own neighborhood"
             )
-        self.diag_canvas.set_face_colors(colors, title)
 
         chosen = [i for i, b in enumerate(self.diag_class_boxes) if b.isChecked()]
         visible = (
@@ -1361,9 +1527,126 @@ class MainWindow(QtWidgets.QMainWindow):
             # two different neighborhoods is a boundary the optimizer trades
             # across, which is a different question entirely.
             visible = visible & (tn[d.left] == tn[d.right])
-        self.diag_canvas.color_edges(
-            render.edge_rgba(d.edge_class, diagnostics.CLASS_COLORS, visible)
+
+        self._diag_base_colors = colors
+        self._diag_base_title = title
+        self._diag_base_visible = visible
+
+        if self.diag_selected is not None:
+            self._paint_selection()
+        else:
+            self.diag_canvas.set_face_colors(colors, title)
+            self.diag_canvas.color_edges(
+                render.edge_rgba(d.edge_class, diagnostics.CLASS_COLORS, visible)
+            )
+
+    # ------------------------------------------------------------------
+    # Click to inspect one tile
+    # ------------------------------------------------------------------
+
+    def _on_tile_clicked(self, xy) -> None:
+        """Select the tile under the cursor, or clear on a click into space."""
+        if self.diag is None or not self.prep:
+            return
+        import shapely
+
+        if self._diag_tree is None:
+            geoms = np.asarray(self.prep.tile_geometries().to_numpy())
+            self._diag_tree = (shapely.STRtree(geoms), geoms)
+        tree, geoms = self._diag_tree
+
+        point = shapely.points(xy[0], xy[1])
+        hit = tree.query(point, predicate="intersects")
+        if len(hit):
+            pos = int(hit[0])
+        else:
+            # Tiles are separated by roads and voids, so a click a few feet wide
+            # of one is far more likely a near-miss than a deselect.
+            tol = max(self.prep.cfg.grid_size_ft / 10.0, 25.0)
+            near = tree.query(point.buffer(tol), predicate="intersects")
+            if not len(near):
+                self.diag_selected = None
+                self._redraw_diagnostics()
+                self._write_diag_report()
+                return
+            dists = shapely.distance(point, geoms[near])
+            pos = int(near[int(np.argmin(dists))])
+
+        self.diag_selected = pos
+        self._paint_selection()
+        self._write_diag_report()
+
+    def _paint_selection(self) -> None:
+        d = self.diag
+        pos = self.diag_selected
+        if d is None or pos is None or self._diag_base_colors is None:
+            return
+
+        # Wash the map out so the selection and its neighbours carry the colour.
+        colors = render.dimmed(self._diag_base_colors)
+        others, classes, _ = d.neighbors_of(pos)
+        for other, cls in zip(others, classes):
+            colors[other] = diagnostics.CLASS_COLORS[int(cls)]
+        colors[pos] = (0.10, 0.10, 0.10)
+
+        tile_id = int(d.tile_ids[pos])
+        self.diag_canvas.set_face_colors(
+            colors, f"Tile {tile_id} and its {len(others)} graph neighbours"
         )
+        # Every edge of this tile, whatever the class filters say -- a partial
+        # picture of one tile's connections is worse than none.
+        self.diag_canvas.color_edges(
+            render.edge_rgba(
+                d.edge_class, diagnostics.CLASS_COLORS,
+                d.edges_touching(pos), alpha=1.0,
+            )
+        )
+
+    def _selection_report(self) -> str:
+        d = self.diag
+        pos = self.diag_selected
+        if d is None or pos is None:
+            return ""
+        tn = self.diag_tile_n_ids
+        others, classes, gaps = d.neighbors_of(pos)
+        mine = int(tn[pos]) if tn is not None else -1
+
+        n_parcels = 0
+        if self.prep is not None:
+            try:
+                n_parcels = len(self.prep.optimizer.tile_parcels[pos])
+            except Exception:  # noqa: BLE001 - a diagnostic must not throw
+                n_parcels = 0
+
+        lines = [
+            f"Tile {int(d.tile_ids[pos])}   neighborhood {mine}   "
+            f"{n_parcels:,} parcels   {d.areas[pos]:,.0f} sq ft",
+            f"  joined to {len(others)} tiles:",
+        ]
+        for cls in (diagnostics.ROOK, diagnostics.CORNER, diagnostics.GAP):
+            sel = classes == cls
+            if not sel.any():
+                continue
+            same = int((tn[others[sel]] == mine).sum()) if tn is not None else 0
+            detail = ""
+            if cls == diagnostics.GAP:
+                g = gaps[sel]
+                detail = f"  [{g.min():,.0f}-{g.max():,.0f} ft]"
+            lines.append(
+                f"    {diagnostics.CLASS_NAMES[cls]:<16} {int(sel.sum()):>3}"
+                f"   {same} in this neighborhood{detail}"
+            )
+
+        if tn is not None:
+            same_all = tn[others] == mine
+            rook_same = int((same_all & (classes == diagnostics.ROOK)).sum())
+            if same_all.any() and rook_same == 0:
+                lines.append(
+                    "  NOTE: nothing in its own neighborhood shares a border "
+                    "with it -- this tile is held on by corners and gaps alone."
+                )
+        lines.append("  (click empty space to clear)")
+        return "\n".join(lines) + "\n" + "-" * 68 + "\n"
 
     def _write_diag_report(self) -> None:
         if self.diag is None or self.diag_tile_n_ids is None:
@@ -1375,10 +1658,14 @@ class MainWindow(QtWidgets.QMainWindow):
             f"{name}   adjacency_mode={mode}   threshold={thresh:.0f} ft\n"
             + "-" * 68 + "\n"
         )
-        text = header + self.diag.summary(self.diag_tile_n_ids)
-        self.diag_report.setPlainText(text)
-        for line in text.splitlines():
-            self.log(line)
+        summary = header + self.diag.summary(self.diag_tile_n_ids)
+        if summary != self._diag_summary:
+            # Only the global report is worth logging, and only when it changes;
+            # clicking around the map should not fill the log with repeats.
+            self._diag_summary = summary
+            for line in summary.splitlines():
+                self.log(line)
+        self.diag_report.setPlainText(self._selection_report() + summary)
 
     # ------------------------------------------------------------------
 
