@@ -23,7 +23,7 @@ from matplotlib.backends.backend_qtagg import (  # noqa: E402
     FigureCanvasQTAgg,
     NavigationToolbar2QT,
 )
-from matplotlib.collections import PolyCollection  # noqa: E402
+from matplotlib.collections import LineCollection, PolyCollection  # noqa: E402
 from matplotlib.figure import Figure  # noqa: E402
 
 from render import build_polygons, neighborhood_colors  # noqa: E402
@@ -43,6 +43,7 @@ class MapCanvas(FigureCanvasQTAgg):
 
         self.collection: Optional[PolyCollection] = None
         self.part_to_tile: Optional[np.ndarray] = None
+        self.edges: Optional[LineCollection] = None
         self._title = ""
 
         self.ax.text(
@@ -66,6 +67,7 @@ class MapCanvas(FigureCanvasQTAgg):
         self.ax.clear()
         self._style_axes()
         self._title = ""  # ax.clear() wiped the drawn title; forget the cache
+        self.edges = None  # ...and took any edge overlay with it
 
         verts, owner = build_polygons(geometries, simplify_tolerance)
         self.part_to_tile = owner
@@ -100,11 +102,65 @@ class MapCanvas(FigureCanvasQTAgg):
         if self.collection is None or self.part_to_tile is None:
             return
         colors = neighborhood_colors(np.asarray(tile_n_ids))
+        self.set_face_colors(colors, title)
+
+    def set_face_colors(self, colors: np.ndarray, title: str = "") -> None:
+        """Paint tiles from an explicit (n_tiles, 3 or 4) colour array.
+
+        ``update_colors`` is the neighborhood-id shortcut onto this; the
+        diagnostics views need to colour by things that are not neighborhood
+        ids (fragment index, defect flags) and come in here directly.
+        """
+        if self.collection is None or self.part_to_tile is None:
+            return
+        colors = np.asarray(colors, dtype=np.float64)
         self.collection.set_facecolors(colors[self.part_to_tile])
+        self.set_title(title)
+        self.draw_idle()
+
+    def set_title(self, title: str) -> None:
         if title and title != self._title:
             self._title = title
             self.ax.set_title(title, fontsize=10, color="#444")
+
+    # ------------------------------------------------------------------
+    # Adjacency overlay
+    # ------------------------------------------------------------------
+
+    def set_edges(self, segments: np.ndarray, linewidth: float = 0.7) -> None:
+        """Install the adjacency overlay: one line segment per graph edge.
+
+        Built once and then recoloured, for the same reason the tiles are: a
+        county's graph runs to a couple of hundred thousand segments, and
+        rebuilding the collection every time a checkbox is toggled is visibly
+        slow. Hiding an edge is an alpha of zero, not a rebuild.
+        """
+        if self.edges is not None:
+            self.edges.remove()
+            self.edges = None
+        segments = np.asarray(segments, dtype=np.float64)
+        if not len(segments):
+            self.draw_idle()
+            return
+        self.edges = LineCollection(
+            segments, linewidths=linewidth, zorder=6, antialiaseds=True
+        )
+        self.edges.set_colors(np.zeros((len(segments), 4)))
+        self.ax.add_collection(self.edges)
         self.draw_idle()
+
+    def color_edges(self, rgba: np.ndarray) -> None:
+        """Recolour the overlay. An alpha of 0 hides that edge."""
+        if self.edges is None:
+            return
+        self.edges.set_colors(np.asarray(rgba, dtype=np.float64))
+        self.draw_idle()
+
+    def clear_edges(self) -> None:
+        if self.edges is not None:
+            self.edges.remove()
+            self.edges = None
+            self.draw_idle()
 
     # ------------------------------------------------------------------
     def save_png(self, path: str, dpi: int = 200) -> None:

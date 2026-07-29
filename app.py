@@ -18,9 +18,11 @@ from typing import Callable, List, Optional
 import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
 
+import diagnostics
 import fields
 import pipeline
 import pyarrow
+import render
 import sources
 from checkpoints import Checkpoint, CheckpointStore, find_runs
 from config import (
@@ -30,7 +32,7 @@ from config import (
     runs_dir,
 )
 from engine import OptimizerStats
-from mapview import MapCanvas, make_toolbar
+from mapview import MapCanvas, make_toolbar, neighborhood_colors
 from sources import Jurisdiction
 
 
@@ -284,9 +286,10 @@ class MainWindow(QtWidgets.QMainWindow):
         rv = QtWidgets.QVBoxLayout(right)
         rv.setContentsMargins(0, 0, 0, 0)
 
-        self.canvas = MapCanvas()
-        rv.addWidget(make_toolbar(self.canvas, self))
-        rv.addWidget(self.canvas, 1)
+        self.tabs = QtWidgets.QTabWidget()
+        self.tabs.addTab(self._map_tab(), "Map")
+        self.tabs.addTab(self._diagnostics_tab(), "Tile diagnostics")
+        rv.addWidget(self.tabs, 1)
 
         self.stats_label = QtWidgets.QLabel("Idle")
         self.stats_label.setStyleSheet(
@@ -315,6 +318,122 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Only now that ckpt_combo and log_view exist is it safe to scan ./runs.
         self.refresh_runs()
+
+    # ---------------- tabs ----------------
+
+    def _map_tab(self) -> QtWidgets.QWidget:
+        page = QtWidgets.QWidget()
+        v = QtWidgets.QVBoxLayout(page)
+        v.setContentsMargins(0, 0, 0, 0)
+        self.canvas = MapCanvas()
+        v.addWidget(make_toolbar(self.canvas, self))
+        v.addWidget(self.canvas, 1)
+        return page
+
+    #: (label, view key) for the diagnostics view picker.
+    DIAG_VIEWS = (
+        ("Adjacency edges by kind", "edges"),
+        ("Neighborhoods + weak joints", "joints"),
+        ("Contiguous fragments", "fragments"),
+        ("Tiles with no shared border", "orphans"),
+    )
+
+    def _diagnostics_tab(self) -> QtWidgets.QWidget:
+        """Inspect the graph the optimizer treats as 'contiguous'.
+
+        The main map draws neighborhoods but not the edges holding them
+        together, which is exactly the information needed to tell a genuine
+        neighborhood from one that only looks joined because two tiles touch at
+        a corner. This tab draws the graph itself.
+        """
+        page = QtWidgets.QWidget()
+        v = QtWidgets.QVBoxLayout(page)
+        v.setContentsMargins(6, 6, 6, 6)
+
+        # ---- controls ----
+        row = QtWidgets.QHBoxLayout()
+        self.diag_btn = QtWidgets.QPushButton("Analyse tiles")
+        self.diag_btn.setToolTip(
+            "Classify every edge of the current run's adjacency graph.\n"
+            "Works on a prepared run, including one that is still optimizing."
+        )
+        self.diag_btn.clicked.connect(self.on_analyse_tiles)
+        row.addWidget(self.diag_btn)
+
+        self.diag_view = QtWidgets.QComboBox()
+        for label, key in self.DIAG_VIEWS:
+            self.diag_view.addItem(label, key)
+        self.diag_view.currentIndexChanged.connect(self._on_diag_view_changed)
+        self.diag_view.setEnabled(False)
+        row.addWidget(QtWidgets.QLabel("View"))
+        row.addWidget(self.diag_view, 1)
+
+        self.diag_refresh = QtWidgets.QPushButton("Re-read assignment")
+        self.diag_refresh.setToolTip(
+            "Re-colour against the optimizer's current state without "
+            "reclassifying the geometry (which is the slow part)."
+        )
+        self.diag_refresh.clicked.connect(self.on_diag_refresh)
+        self.diag_refresh.setEnabled(False)
+        row.addWidget(self.diag_refresh)
+        v.addLayout(row)
+
+        # ---- edge class toggles ----
+        row2 = QtWidgets.QHBoxLayout()
+        row2.addWidget(QtWidgets.QLabel("Show edges:"))
+        self.diag_class_boxes = []
+        for cls, name in enumerate(diagnostics.CLASS_NAMES):
+            colour = diagnostics.CLASS_COLORS[cls]
+            box = QtWidgets.QCheckBox(name)
+            box.setChecked(cls != diagnostics.ROOK)  # the defects, by default
+            box.setStyleSheet(
+                "color: rgb({}, {}, {}); font-weight: bold;".format(
+                    *[int(255 * c) for c in colour]
+                )
+            )
+            box.stateChanged.connect(self._redraw_diagnostics)
+            self.diag_class_boxes.append(box)
+            row2.addWidget(box)
+        row2.addStretch(1)
+        v.addLayout(row2)
+
+        # ---- canvas + report ----
+        split = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
+        holder = QtWidgets.QWidget()
+        hv = QtWidgets.QVBoxLayout(holder)
+        hv.setContentsMargins(0, 0, 0, 0)
+        self.diag_canvas = MapCanvas()
+        hv.addWidget(make_toolbar(self.diag_canvas, self))
+        hv.addWidget(self.diag_canvas, 1)
+        split.addWidget(holder)
+
+        self.diag_report = QtWidgets.QPlainTextEdit()
+        self.diag_report.setReadOnly(True)
+        self.diag_report.setStyleSheet(
+            "font-family: Consolas, monospace; font-size: 11px;"
+        )
+        self.diag_report.setPlainText(
+            "Prepare or resume a run, then press “Analyse tiles”.\n\n"
+            "Every edge of the optimizer's adjacency graph is classified by the "
+            "geometry behind it:\n"
+            "  shared border  the tiles run along each other. A real neighbour.\n"
+            "  corner only    they meet at a point. Trading across one of these "
+            "is what produces\n"
+            "                 the checkerboard -- the optimizer thinks the pieces "
+            "are joined.\n"
+            "  gap bridged    they never touch; only the adjacency threshold "
+            "joins them.\n\n"
+            "enforce_contiguity and the severed-component split both consult this "
+            "same graph, so\nanything it calls connected is invisible to them."
+        )
+        split.addWidget(self.diag_report)
+        split.setStretchFactor(0, 1)
+        split.setSizes([700, 190])
+        v.addWidget(split, 1)
+
+        self.diag: Optional[diagnostics.TileDiagnostics] = None
+        self.diag_tile_n_ids: Optional[np.ndarray] = None
+        return page
 
     # ---------------- boxes ----------------
 
@@ -650,6 +769,9 @@ class MainWindow(QtWidgets.QMainWindow):
         can_start = (not on) and not self.running()
         self.start_btn.setEnabled(can_start)
         self.resume_btn.setEnabled(can_start)
+        # The diagnostics only need a prepared run, not an idle one -- they are
+        # useful mid-optimization -- but they must not contend for self.task.
+        self.diag_btn.setEnabled((not on) and self.prep is not None)
 
     def _error_box(self, tb: str) -> None:
         self.log(tb)
@@ -1033,6 +1155,14 @@ class MainWindow(QtWidgets.QMainWindow):
         # must not silently write the old run's data.
         self.prep = None
         self.export_btn.setEnabled(False)
+        # Same reasoning for the diagnostics: they describe a tileset that is
+        # about to be replaced, and their tile count may not even match the new
+        # one.
+        self.diag = None
+        self.diag_tile_n_ids = None
+        self.diag_view.setEnabled(False)
+        self.diag_refresh.setEnabled(False)
+        self.diag_canvas.clear_edges()
         self.busy(True, "Preparing…")
         self.log("=" * 60)
 
@@ -1089,6 +1219,166 @@ class MainWindow(QtWidgets.QMainWindow):
         self.export_btn.setEnabled(True)
         self.start_btn.setEnabled(False)
         self.resume_btn.setEnabled(False)
+
+    # ------------------------------------------------------------------
+    # Tile diagnostics
+    # ------------------------------------------------------------------
+
+    def on_analyse_tiles(self) -> None:
+        if not self.prep:
+            QtWidgets.QMessageBox.information(
+                self, "Nothing to analyse",
+                "Start or resume a run first. The diagnostics read the "
+                "adjacency graph that run built.",
+            )
+            return
+        if self.task is not None and self.task.isRunning():
+            QtWidgets.QMessageBox.information(
+                self, "Busy", "Something else is still working; try again in a moment."
+            )
+            return
+
+        prep = self.prep
+        adj = prep.tile_adjacency or {}
+        if not adj:
+            QtWidgets.QMessageBox.warning(
+                self, "No adjacency graph",
+                "This run has no tile adjacency recorded, so there is nothing "
+                "to classify.",
+            )
+            return
+
+        geoms = prep.tile_geometries()
+        tile_ids = prep.optimizer.tile_ids
+        # Snapshot the assignment on this thread. A run in progress will have
+        # moved on by the time the classification finishes, which is fine -- the
+        # report is explicitly about the state at the moment you pressed the
+        # button, and the geometry it classifies does not change at all.
+        self.diag_tile_n_ids = prep.optimizer.tile_n_ids.copy()
+
+        self.busy(True, "Classifying the adjacency graph…")
+        self.diag_btn.setEnabled(False)
+        self.log("=" * 60)
+
+        def work(log):
+            return diagnostics.analyse(geoms, adj, tile_ids, progress=log)
+
+        self.task = Task(work, self)
+        self.task.log.connect(self.log)
+        self.task.failed.connect(self._on_diag_failed)
+        self.task.done.connect(self._on_diag_ready)
+        self.task.start()
+
+    def _on_diag_failed(self, tb: str) -> None:
+        self.diag_btn.setEnabled(True)
+        self.on_failed(tb)
+
+    def _on_diag_ready(self, diag) -> None:
+        self.diag = diag
+        self.busy(False, "Diagnostics ready")
+        self.diag_btn.setEnabled(True)
+        self.diag_view.setEnabled(True)
+        self.diag_refresh.setEnabled(True)
+
+        prep = self.prep
+        self.diag_canvas.set_tiles(
+            prep.tile_geometries(),
+            simplify_tolerance=max(prep.cfg.grid_size_ft / 50.0, 1.0),
+            boundary=prep.jurisdiction_gdf.to_crs(prep.working_crs),
+        )
+        self.diag_canvas.set_edges(diag.segments())
+        # Via the view handler, not straight to the redraw, so the current view
+        # gets its intended class defaults on first paint as well as on a change.
+        self._on_diag_view_changed()
+        self._write_diag_report()
+        self.tabs.setCurrentIndex(1)
+
+    def on_diag_refresh(self) -> None:
+        """Re-colour against the optimizer's current assignment."""
+        if self.diag is None or not self.prep:
+            return
+        tn = self.prep.optimizer.tile_n_ids
+        if len(tn) != self.diag.n_tiles:
+            QtWidgets.QMessageBox.warning(
+                self, "Tileset changed",
+                "The prepared run no longer matches these diagnostics. "
+                "Press “Analyse tiles” again.",
+            )
+            return
+        self.diag_tile_n_ids = np.asarray(tn).copy()
+        self._redraw_diagnostics()
+        self._write_diag_report()
+
+    def _on_diag_view_changed(self, *_) -> None:
+        # "Adjacency edges by kind" is about the fabric, so it wants every class
+        # on; the other views are about defects inside a neighborhood, where the
+        # shared borders are the uninteresting majority.
+        key = self.diag_view.currentData()
+        want_rook = key == "edges"
+        rook_box = self.diag_class_boxes[diagnostics.ROOK]
+        if rook_box.isChecked() != want_rook:
+            rook_box.blockSignals(True)
+            rook_box.setChecked(want_rook)
+            rook_box.blockSignals(False)
+        self._redraw_diagnostics()
+
+    def _redraw_diagnostics(self, *_) -> None:
+        d = self.diag
+        tn = self.diag_tile_n_ids
+        if d is None or tn is None:
+            return
+
+        key = self.diag_view.currentData()
+        if key == "edges":
+            colors = render.flat_fill(d.n_tiles)
+            title = f"{d.n_edges:,} adjacency edges by kind"
+        elif key == "joints":
+            colors = neighborhood_colors(tn)
+            title = "Neighborhoods, with their weak internal joints drawn"
+        elif key == "fragments":
+            labels, count = d.components(tn, (diagnostics.ROOK,))
+            colors = render.fragment_colors(labels)
+            title = (
+                f"{count:,} shared-border fragments across "
+                f"{len(np.unique(tn)):,} neighborhoods"
+            )
+        else:
+            weak = d.weak_tiles(tn)
+            colors = render.defect_colors(weak)
+            title = (
+                f"{int(weak.sum()):,} tiles have no shared border with their "
+                "own neighborhood"
+            )
+        self.diag_canvas.set_face_colors(colors, title)
+
+        chosen = [i for i, b in enumerate(self.diag_class_boxes) if b.isChecked()]
+        visible = (
+            d.class_mask(*chosen) if chosen
+            else np.zeros(d.n_edges, dtype=bool)
+        )
+        if key != "edges":
+            # Only edges *within* one neighborhood are joints. An edge between
+            # two different neighborhoods is a boundary the optimizer trades
+            # across, which is a different question entirely.
+            visible = visible & (tn[d.left] == tn[d.right])
+        self.diag_canvas.color_edges(
+            render.edge_rgba(d.edge_class, diagnostics.CLASS_COLORS, visible)
+        )
+
+    def _write_diag_report(self) -> None:
+        if self.diag is None or self.diag_tile_n_ids is None:
+            return
+        name = self.prep.cfg.jurisdiction_name if self.prep else ""
+        mode = self.prep.cfg.adjacency_mode if self.prep else "?"
+        thresh = self.prep.cfg.adjacency_threshold_ft if self.prep else 0.0
+        header = (
+            f"{name}   adjacency_mode={mode}   threshold={thresh:.0f} ft\n"
+            + "-" * 68 + "\n"
+        )
+        text = header + self.diag.summary(self.diag_tile_n_ids)
+        self.diag_report.setPlainText(text)
+        for line in text.splitlines():
+            self.log(line)
 
     # ------------------------------------------------------------------
 

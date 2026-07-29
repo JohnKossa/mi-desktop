@@ -19,6 +19,52 @@ def neighborhood_colors(n_ids: np.ndarray, seed: int = 12345) -> np.ndarray:
     return _BASE[idx]
 
 
+#: Tile fills for the diagnostics views. Muted, so the edge overlay reads on top.
+IDLE_FILL = (0.88, 0.88, 0.88)
+OK_FILL = (0.80, 0.86, 0.80)
+DEFECT_FILL = (0.84, 0.15, 0.16)
+
+
+def fragment_colors(labels: np.ndarray) -> np.ndarray:
+    """Colour tiles by connected-component id.
+
+    Uses the same hashed cycle as ``neighborhood_colors``, so a neighborhood
+    that is genuinely one piece looks flat here and a shattered one turns to
+    confetti -- which is the whole point of the view.
+    """
+    return neighborhood_colors(labels)
+
+
+def defect_colors(weak: np.ndarray) -> np.ndarray:
+    """Red where a tile has no shared border with its own neighborhood."""
+    weak = np.asarray(weak, dtype=bool)
+    out = np.tile(np.asarray(OK_FILL, dtype=np.float64), (len(weak), 1))
+    out[weak] = DEFECT_FILL
+    return out
+
+
+def flat_fill(n: int, color=IDLE_FILL) -> np.ndarray:
+    return np.tile(np.asarray(color, dtype=np.float64), (max(n, 0), 1))
+
+
+def edge_rgba(
+    edge_class: np.ndarray,
+    class_colors,
+    visible: np.ndarray,
+    alpha: float = 0.9,
+) -> np.ndarray:
+    """(E, 4) colours for the adjacency overlay; invisible edges get alpha 0."""
+    edge_class = np.asarray(edge_class, dtype=np.int64)
+    visible = np.asarray(visible, dtype=bool)
+    palette = np.asarray(class_colors, dtype=np.float64)
+    out = np.zeros((len(edge_class), 4), dtype=np.float64)
+    if not len(edge_class):
+        return out
+    out[:, :3] = palette[edge_class]
+    out[:, 3] = np.where(visible, alpha, 0.0)
+    return out
+
+
 def polygon_parts(geom) -> List[np.ndarray]:
     """Exterior rings of a (Multi)Polygon as coordinate arrays."""
     if geom is None or geom.is_empty:
