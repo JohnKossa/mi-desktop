@@ -449,6 +449,130 @@ def test_dedupe_drops_cross_cell_repeats():
 
 
 # ==========================================================================
+# Toggles must actually prevent network calls
+# ==========================================================================
+
+
+def test_every_osm_layer_has_a_toggle_that_prepare_honours():
+    """Regression: waterway lines fetched unconditionally.
+
+    `use_osm_roads` and `clip_water` existed, but the waterway-centreline fetch
+    had no toggle at all -- so switching every OSM option off in the UI still
+    fired an Overpass query, and still failed on a jurisdiction Overpass refused.
+    """
+    import ast
+    import inspect
+
+    import pipeline
+    from config import RunConfig
+
+    tree = ast.parse(inspect.getsource(pipeline.prepare))
+    guarded = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.IfExp):
+            continue
+        called = [
+            n.func.attr for n in ast.walk(node.body)
+            if isinstance(n, ast.Call) and hasattr(n.func, "attr")
+        ]
+        flags = [n.attr for n in ast.walk(node.test) if isinstance(n, ast.Attribute)]
+        for name in called:
+            if name.startswith("fetch_osm") or name == "fetch_blocks":
+                guarded[name] = flags
+
+    for fetcher in ("fetch_osm_roads", "fetch_osm_waterway_lines",
+                    "fetch_osm_water_areas"):
+        assert fetcher in guarded, (
+            f"{fetcher} is called unconditionally in prepare(); it needs a toggle"
+        )
+        assert guarded[fetcher], f"{fetcher} has no config flag guarding it"
+        for flag in guarded[fetcher]:
+            assert hasattr(RunConfig(), flag), f"{flag} is not a RunConfig field"
+
+
+def test_rate_limiting_is_not_treated_as_too_big():
+    """A 429 must back off, not subdivide.
+
+    OverpassTooBig makes the caller split the area into four and issue four more
+    queries -- exactly the wrong reply to a server asking us to slow down. Only
+    evidence of size (a truncation remark, or every endpoint timing out) should
+    trigger a split.
+    """
+    calls = []
+
+    class FakeResponse:
+        def __init__(self, code):
+            self.status_code = code
+
+        def json(self):
+            return {"elements": []}
+
+        def raise_for_status(self):
+            pass
+
+    class FakeSession:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def post(self, url, **kw):
+            calls.append(url)
+            return FakeResponse(429)
+
+    orig_session, orig_backoff = sources._session, sources.RATE_LIMIT_BACKOFF_S
+    sources._session = FakeSession
+    sources.RATE_LIMIT_BACKOFF_S = 0.0
+    try:
+        try:
+            sources._overpass("[out:json];out;")
+        except sources.OverpassTooBig as exc:
+            raise AssertionError(f"429 was reported as too-big: {exc}")
+        except RuntimeError:
+            pass  # correct: a plain failure after trying every endpoint
+        assert len(calls) == len(sources.OVERPASS_ENDPOINTS), (
+            f"should have tried every endpoint, tried {len(calls)}"
+        )
+    finally:
+        sources._session = orig_session
+        sources.RATE_LIMIT_BACKOFF_S = orig_backoff
+
+
+def test_gateway_timeout_on_every_endpoint_does_signal_too_big():
+    class FakeResponse:
+        status_code = 504
+
+        def json(self):
+            return {}
+
+        def raise_for_status(self):
+            pass
+
+    class FakeSession:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def post(self, url, **kw):
+            return FakeResponse()
+
+    orig = sources._session
+    sources._session = FakeSession
+    try:
+        try:
+            sources._overpass("[out:json];out;")
+        except sources.OverpassTooBig:
+            pass  # correct: consistent timeouts do point at extent
+        else:
+            raise AssertionError("expected OverpassTooBig once all endpoints 504")
+    finally:
+        sources._session = orig
+
+
+# ==========================================================================
 
 
 def main() -> int:

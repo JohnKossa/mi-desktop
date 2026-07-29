@@ -18,6 +18,7 @@ from typing import Callable, List, Optional
 import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
 
+import fields
 import pipeline
 import pyarrow
 import sources
@@ -144,9 +145,19 @@ class OptimizeThread(QtCore.QThread):
 
 
 class WeightsTable(QtWidgets.QTableWidget):
+    """Scored fields and their weights.
+
+    Rows are *derived* from the binning selection rather than typed, so a weight
+    can no longer name a field that never gets binned -- which was the easiest
+    mistake to make with free text and the last one to surface.
+
+    Displayed names are source columns; the config still stores the ``*_binned``
+    form, so run_config.json and the notebook's WEIGHTS dict stay compatible.
+    """
+
     def __init__(self, parent=None):
         super().__init__(0, 2, parent)
-        self.setHorizontalHeaderLabels(["Binned field", "Weight"])
+        self.setHorizontalHeaderLabels(["Scored field", "Weight"])
         self.horizontalHeader().setSectionResizeMode(
             0, QtWidgets.QHeaderView.ResizeMode.Stretch
         )
@@ -158,34 +169,58 @@ class WeightsTable(QtWidgets.QTableWidget):
             QtWidgets.QAbstractItemView.EditTrigger.DoubleClicked
             | QtWidgets.QAbstractItemView.EditTrigger.SelectedClicked
         )
-        self.set_weights(DEFAULT_WEIGHTS)
+        self._orphans: set = set()
 
-    def set_weights(self, weights: dict) -> None:
+    # ------------------------------------------------------------------
+    def set_candidates(self, sources, weights: dict) -> None:
+        """Rebuild rows from ``sources``, keeping any weights already set.
+
+        ``weights`` is keyed on the stored (``*_binned``) name. Entries that do
+        not correspond to a candidate are kept as flagged rows rather than
+        dropped -- a config loaded from an older run should never silently lose
+        settings.
+        """
+        current = self.weights()
+        current.update(weights or {})
+
+        ordered = list(dict.fromkeys(sources))
+        self._orphans = {
+            fields.source_name(k) for k in current
+            if fields.source_name(k) not in ordered
+        }
+        rows = ordered + sorted(self._orphans)
+
+        self.blockSignals(True)
         self.setRowCount(0)
-        for name, w in weights.items():
-            self.add_row(name, w)
-
-    def add_row(self, name: str = "", weight: float = 1.0) -> None:
-        r = self.rowCount()
-        self.insertRow(r)
-        self.setItem(r, 0, QtWidgets.QTableWidgetItem(name))
-        self.setItem(r, 1, QtWidgets.QTableWidgetItem(f"{weight:g}"))
-
-    def remove_selected(self) -> None:
-        for r in sorted({i.row() for i in self.selectedIndexes()}, reverse=True):
-            self.removeRow(r)
+        for name in rows:
+            r = self.rowCount()
+            self.insertRow(r)
+            item = QtWidgets.QTableWidgetItem(name)
+            item.setFlags(item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
+            if name in self._orphans:
+                item.setForeground(QtGui.QColor("#c0392b"))
+                item.setToolTip(
+                    "Not in the binning list, so this field is never created. "
+                    "Tick it under 'Bin these fields', or set its weight to 0."
+                )
+            self.setItem(r, 0, item)
+            w = current.get(fields.scored_name(name), 0.0)
+            self.setItem(r, 1, QtWidgets.QTableWidgetItem(f"{float(w):g}"))
+        self.blockSignals(False)
 
     def weights(self) -> dict:
+        """``{binned_name: weight}`` for every row with a non-zero weight."""
         out = {}
         for r in range(self.rowCount()):
-            name_item = self.item(r, 0)
-            w_item = self.item(r, 1)
+            name_item, w_item = self.item(r, 0), self.item(r, 1)
             if not name_item or not name_item.text().strip():
                 continue
             try:
-                out[name_item.text().strip()] = float(w_item.text()) if w_item else 1.0
+                w = float(w_item.text()) if w_item else 0.0
             except ValueError:
-                out[name_item.text().strip()] = 1.0
+                w = 0.0
+            if w != 0.0:
+                out[fields.scored_name(name_item.text().strip())] = w
         return out
 
 
@@ -202,6 +237,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.cfg = RunConfig()
         self.matches: List[Jurisdiction] = []
+        self.universe: Optional[fields.FieldUniverse] = None
+        self.field_problems: List[fields.Problem] = []
+        self._inspected_path: Optional[str] = None
         self.prep: Optional[pipeline.PreparedRun] = None
         self.task: Optional[Task] = None
         self.opt_thread: Optional[OptimizeThread] = None
@@ -224,9 +262,22 @@ class MainWindow(QtWidgets.QMainWindow):
 
         lv.addWidget(self._jurisdiction_box())
         lv.addWidget(self._parcels_box())
+        lv.addWidget(self._fields_box(), 1)
         lv.addWidget(self._tiling_box())
-        lv.addWidget(self._scoring_box(), 1)
+        lv.addWidget(self._scoring_box())
         lv.addWidget(self._control_box())
+
+        # The setup column has outgrown a fixed height now that field pickers
+        # live in it, so let it scroll rather than squashing the weights table.
+        scroller = QtWidgets.QScrollArea()
+        scroller.setWidget(left)
+        scroller.setWidgetResizable(True)
+        scroller.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        scroller.setHorizontalScrollBarPolicy(
+            QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        scroller.setMinimumWidth(460)
+        scroller.setMaximumWidth(580)
 
         # ---------------- right column ----------------
         right = QtWidgets.QWidget()
@@ -250,7 +301,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.log_view.setFixedHeight(170)
         rv.addWidget(self.log_view)
 
-        splitter.addWidget(left)
+        splitter.addWidget(scroller)
         splitter.addWidget(right)
         splitter.setStretchFactor(1, 1)
         self.setCentralWidget(splitter)
@@ -293,11 +344,33 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.parcel_edit = QtWidgets.QLineEdit()
         self.parcel_edit.setPlaceholderText("parcel .parquet / .gpkg / .shp / .geojson")
-        browse = QtWidgets.QPushButton("Browse…")
+        self.parcel_edit.editingFinished.connect(self.on_parcel_path_changed)
+        browse = QtWidgets.QPushButton("Browse\u2026")
         browse.clicked.connect(self.on_browse_parcels)
 
-        self.filter_col = QtWidgets.QLineEdit(self.cfg.parcel_filter_column)
-        self.filter_val = QtWidgets.QLineEdit(self.cfg.parcel_filter_value)
+        # Editable combos, not plain dropdowns: they must still work before a
+        # file is chosen, and must not discard a value loaded from an older
+        # run_config.json that names a column this file happens to lack.
+        self.filter_col = QtWidgets.QComboBox()
+        self.filter_col.setEditable(True)
+        self.filter_col.setCurrentText(self.cfg.parcel_filter_column)
+        self.filter_col.currentTextChanged.connect(self.on_filter_column_changed)
+        self.filter_col.setToolTip(
+            "Column that says which parcels to model. Populated from the file "
+            "once one is selected; you can still type a name."
+        )
+
+        self.filter_val = QtWidgets.QComboBox()
+        self.filter_val.setEditable(True)
+        self.filter_val.setCurrentText(self.cfg.parcel_filter_value)
+        self.filter_val.setToolTip(
+            "Value to keep. Populated with the distinct values actually present "
+            "in the chosen column, most common first."
+        )
+
+        self.field_status = QtWidgets.QLabel("No parcel file selected.")
+        self.field_status.setWordWrap(True)
+        self.field_status.setStyleSheet("color: #777; font-size: 10px;")
 
         g.addWidget(QtWidgets.QLabel("File"), 0, 0)
         g.addWidget(self.parcel_edit, 0, 1, 1, 2)
@@ -306,6 +379,44 @@ class MainWindow(QtWidgets.QMainWindow):
         g.addWidget(self.filter_col, 1, 1)
         g.addWidget(QtWidgets.QLabel("=="), 1, 2)
         g.addWidget(self.filter_val, 1, 3)
+        g.addWidget(self.field_status, 2, 0, 1, 4)
+        return box
+
+    def _fields_box(self) -> QtWidgets.QWidget:
+        """Everything that names a column, driven by the file's own schema."""
+        box = QtWidgets.QGroupBox("3. Fields")
+        v = QtWidgets.QVBoxLayout(box)
+
+        row = QtWidgets.QHBoxLayout()
+        self.land_class_combo = QtWidgets.QComboBox()
+        self.land_class_combo.setEditable(True)
+        self.land_class_combo.setCurrentText(self.cfg.land_class_column)
+        self.land_class_combo.setToolTip(
+            "Column naming each parcel's land class. Only used when sightlines "
+            "are blocked by 'all except in-gap classes'. Optional."
+        )
+        row.addWidget(QtWidgets.QLabel("Land class"))
+        row.addWidget(self.land_class_combo, 1)
+        v.addLayout(row)
+
+        v.addWidget(QtWidgets.QLabel("Bin these fields (scoring candidates)"))
+        self.continuous_list = self._make_checklist(
+            "Numeric or derivable columns to bin. Only binned fields can be "
+            "scored, so this list drives the weights table below."
+        )
+        self.continuous_list.itemChanged.connect(self.on_continuous_changed)
+        v.addWidget(self.continuous_list)
+
+        v.addWidget(QtWidgets.QLabel("Weights (0 = not scored)"))
+        self.weights_table = WeightsTable()
+        v.addWidget(self.weights_table, 1)
+
+        v.addWidget(QtWidgets.QLabel("Seed on these fields (KMeans)"))
+        self.seed_list = self._make_checklist(
+            "Fields the initial KMeans seeding clusters on. Position columns "
+            "plus whatever separates submarkets in this jurisdiction."
+        )
+        v.addWidget(self.seed_list)
         return box
 
     def _tiling_box(self) -> QtWidgets.QWidget:
@@ -328,6 +439,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.blocks_chk.setChecked(True)
         self.roads_chk = QtWidgets.QCheckBox("OSM roads")
         self.roads_chk.setChecked(True)
+        self.waterways_chk = QtWidgets.QCheckBox("OSM waterways")
+        self.waterways_chk.setChecked(True)
+        self.waterways_chk.setToolTip(
+            "River, stream, canal and ditch centrelines as cut lines.\n\n"
+            "Switch off alongside 'OSM roads' if Overpass refuses this "
+            "jurisdiction; tiles then come from census blocks plus the grid."
+        )
         self.water_chk = QtWidgets.QCheckBox("Clip OSM water")
         self.water_chk.setChecked(True)
 
@@ -337,7 +455,8 @@ class MainWindow(QtWidgets.QMainWindow):
         g.addWidget(self.adj_spin, 0, 3)
         g.addWidget(self.blocks_chk, 1, 0, 1, 2)
         g.addWidget(self.roads_chk, 1, 2, 1, 2)
-        g.addWidget(self.water_chk, 2, 0, 1, 2)
+        g.addWidget(self.waterways_chk, 2, 0, 1, 2)
+        g.addWidget(self.water_chk, 2, 2, 1, 2)
         return box
 
     def _scoring_box(self) -> QtWidgets.QWidget:
@@ -381,6 +500,36 @@ class MainWindow(QtWidgets.QMainWindow):
             "a river) never interact, so they can be optimized concurrently.\n"
             "1 = serial. 0 = auto, clamped to the speedup the component "
             "structure actually allows."
+        )
+
+        self.adjacency_combo = QtWidgets.QComboBox()
+        self.adjacency_combo.addItem("tile geometry (original)", "tile")
+        self.adjacency_combo.addItem("parcel + line of sight", "parcel")
+        self.adjacency_combo.setToolTip(
+            "How two tiles come to be considered neighbours.\n\n"
+            "tile geometry: tiles within the threshold of each other. Cheap, but "
+            "two lots with a third lot between them are 'adjacent' whenever lots "
+            "are narrower than the threshold.\n\n"
+            "parcel + line of sight: tiles are neighbours if their parcels are, "
+            "and a pair is dropped when the shortest line between them is blocked "
+            "by another parcel. Streets and canals are usually unparceled so they "
+            "stay crossable; an intervening lot does not. Costs a few seconds once."
+        )
+
+        self.obstacle_combo = QtWidgets.QComboBox()
+        self.obstacle_combo.addItem("modeled parcels only", "modeled")
+        self.obstacle_combo.addItem("all parcels", "all")
+        self.obstacle_combo.addItem("all except in-gap classes", "all_except")
+        self.obstacle_combo.setToolTip(
+            "What blocks a sightline (only used by parcel adjacency).\n\n"
+            "modeled parcels only: farmland, condos and vacant land are "
+            "transparent, so single-family pockets separated by a 'sea' of other "
+            "use classes reconnect.\n\n"
+            "all parcels: anything with a parcel record blocks.\n\n"
+            "all except in-gap classes: everything blocks except right-of-way, "
+            "submerged land, utility strips, common elements and similar. Matched "
+            "by keyword, so it transfers between jurisdictions -- check the log "
+            "for which classes it actually treated as transparent."
         )
 
         self.contiguity_chk = QtWidgets.QCheckBox("Keep neighborhoods contiguous")
@@ -431,31 +580,11 @@ class MainWindow(QtWidgets.QMainWindow):
         form.addWidget(self.workers_spin, 3, 1)
         form.addWidget(self.split_chk, 3, 2, 1, 2)
         form.addWidget(self.contiguity_chk, 4, 0, 1, 4)
+        form.addWidget(QtWidgets.QLabel("Adjacency"), 5, 0)
+        form.addWidget(self.adjacency_combo, 5, 1, 1, 3)
+        form.addWidget(QtWidgets.QLabel("Blocked by"), 6, 0)
+        form.addWidget(self.obstacle_combo, 6, 1, 1, 3)
         v.addLayout(form)
-
-        self.weights_table = WeightsTable()
-        v.addWidget(self.weights_table, 1)
-
-        row = QtWidgets.QHBoxLayout()
-        add = QtWidgets.QPushButton("Add field")
-        add.clicked.connect(lambda: self.weights_table.add_row("", 1.0))
-        rem = QtWidgets.QPushButton("Remove")
-        rem.clicked.connect(self.weights_table.remove_selected)
-        reset = QtWidgets.QPushButton("Defaults")
-        reset.clicked.connect(lambda: self.weights_table.set_weights(DEFAULT_WEIGHTS))
-        row.addWidget(add)
-        row.addWidget(rem)
-        row.addWidget(reset)
-        row.addStretch(1)
-        v.addLayout(row)
-
-        note = QtWidgets.QLabel(
-            "Binned fields are created automatically from: "
-            + ", ".join(CONTINUOUS_VARIABLES)
-        )
-        note.setWordWrap(True)
-        note.setStyleSheet("color: #777; font-size: 10px;")
-        v.addWidget(note)
         return box
 
     def _control_box(self) -> QtWidgets.QWidget:
@@ -548,12 +677,13 @@ class MainWindow(QtWidgets.QMainWindow):
         cfg = RunConfig()
         cfg.jurisdiction_query = self.jur_edit.text().strip()
         cfg.parcel_path = self.parcel_edit.text().strip()
-        cfg.parcel_filter_column = self.filter_col.text().strip()
-        cfg.parcel_filter_value = self.filter_val.text().strip()
+        cfg.parcel_filter_column = self.filter_col.currentText().strip()
+        cfg.parcel_filter_value = self.filter_val.currentText().strip()
         cfg.grid_size_ft = float(self.grid_spin.value())
         cfg.adjacency_threshold_ft = float(self.adj_spin.value())
         cfg.use_census_blocks = self.blocks_chk.isChecked()
         cfg.use_osm_roads = self.roads_chk.isChecked()
+        cfg.use_osm_waterways = self.waterways_chk.isChecked()
         cfg.clip_water = self.water_chk.isChecked()
         cfg.n_neighborhoods = int(self.k_spin.value())
         cfg.max_bins = int(self.bins_spin.value())
@@ -564,18 +694,24 @@ class MainWindow(QtWidgets.QMainWindow):
         cfg.workers = int(self.workers_spin.value())
         cfg.split_severed_neighborhoods = self.split_chk.isChecked()
         cfg.enforce_contiguity = self.contiguity_chk.isChecked()
+        cfg.adjacency_mode = self.adjacency_combo.currentData()
+        cfg.obstacle_mode = self.obstacle_combo.currentData()
+        cfg.land_class_column = self.land_class_combo.currentText().strip()
+        cfg.continuous_variables = self._checked(self.continuous_list)
+        cfg.seed_fields = self._checked(self.seed_list)
         cfg.weights = self.weights_table.weights()
         return cfg
 
     def apply_config(self, cfg: RunConfig) -> None:
         self.jur_edit.setText(cfg.jurisdiction_query)
         self.parcel_edit.setText(cfg.parcel_path)
-        self.filter_col.setText(cfg.parcel_filter_column)
-        self.filter_val.setText(cfg.parcel_filter_value)
+        self.filter_col.setCurrentText(cfg.parcel_filter_column)
+        self.filter_val.setCurrentText(cfg.parcel_filter_value)
         self.grid_spin.setValue(cfg.grid_size_ft)
         self.adj_spin.setValue(cfg.adjacency_threshold_ft)
         self.blocks_chk.setChecked(cfg.use_census_blocks)
         self.roads_chk.setChecked(cfg.use_osm_roads)
+        self.waterways_chk.setChecked(cfg.use_osm_waterways)
         self.water_chk.setChecked(cfg.clip_water)
         self.k_spin.setValue(cfg.n_neighborhoods)
         self.bins_spin.setValue(cfg.max_bins)
@@ -586,11 +722,59 @@ class MainWindow(QtWidgets.QMainWindow):
         self.workers_spin.setValue(cfg.workers)
         self.split_chk.setChecked(cfg.split_severed_neighborhoods)
         self.contiguity_chk.setChecked(cfg.enforce_contiguity)
-        self.weights_table.set_weights(cfg.weights)
+        for combo, value in ((self.adjacency_combo, cfg.adjacency_mode),
+                             (self.obstacle_combo, cfg.obstacle_mode)):
+            idx = combo.findData(value)
+            if idx >= 0:
+                combo.setCurrentIndex(idx)
+        self.land_class_combo.setCurrentText(cfg.land_class_column)
+        opts = self.universe.binnable if self.universe else []
+        self._fill_checklist(self.continuous_list, opts, cfg.continuous_variables)
+        self._fill_checklist(self.seed_list, opts, cfg.seed_fields)
+        self.weights_table.set_candidates(cfg.continuous_variables, cfg.weights)
+        self.revalidate_fields()
 
     # ------------------------------------------------------------------
     # Slots
     # ------------------------------------------------------------------
+
+    def _make_checklist(self, tooltip: str) -> QtWidgets.QListWidget:
+        w = QtWidgets.QListWidget()
+        w.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.NoSelection)
+        w.setFixedHeight(96)
+        w.setToolTip(tooltip)
+        return w
+
+    # ------------------------------------------------------------------
+    # Field introspection
+    # ------------------------------------------------------------------
+
+    def _fill_checklist(self, widget, options, checked) -> None:
+        want = set(checked)
+        # Anything configured but absent from the file is still listed, flagged,
+        # so a loaded config never loses settings silently.
+        missing = [c for c in checked if c not in set(options)]
+        widget.blockSignals(True)
+        widget.clear()
+        for name in list(options) + missing:
+            item = QtWidgets.QListWidgetItem(name)
+            item.setFlags(item.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(
+                QtCore.Qt.CheckState.Checked if name in want
+                else QtCore.Qt.CheckState.Unchecked
+            )
+            if name in missing:
+                item.setForeground(QtGui.QColor("#c0392b"))
+                item.setToolTip("Not present in this parcel file")
+            widget.addItem(item)
+        widget.blockSignals(False)
+
+    @staticmethod
+    def _checked(widget) -> List[str]:
+        return [
+            widget.item(i).text() for i in range(widget.count())
+            if widget.item(i).checkState() == QtCore.Qt.CheckState.Checked
+        ]
 
     def on_browse_parcels(self) -> None:
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
@@ -601,6 +785,122 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         if path:
             self.parcel_edit.setText(path)
+            self.on_parcel_path_changed()
+
+    def on_parcel_path_changed(self) -> None:
+        """Introspect the file as soon as it is named.
+
+        Cheap enough to do eagerly -- ~11 ms for the schema of a 158 MB parquet --
+        and it moves field validation from step 4 of prepare(), after the census
+        download and the shatter, to the moment of choosing.
+        """
+        path = self.parcel_edit.text().strip()
+        if not path or path == getattr(self, "_inspected_path", None):
+            return
+        self._inspected_path = path
+        self.field_status.setText("Reading fields\u2026")
+
+        def work(log):
+            uni = fields.inspect_parcel_file(path, progress=log)
+            values = fields.distinct_values(
+                path, self.cfg.parcel_filter_column, progress=log
+            ) if uni.ok else []
+            return uni, values
+
+        self.task = Task(work, self)
+        self.task.log.connect(self.log)
+        self.task.failed.connect(self.on_failed)
+        self.task.done.connect(self.on_fields_read)
+        self.task.start()
+
+    def on_fields_read(self, payload) -> None:
+        uni, values = payload
+        self.universe = uni
+        if not uni.ok:
+            self.field_status.setStyleSheet("color: #c0392b; font-size: 10px;")
+            self.field_status.setText(f"Could not read fields: {uni.error}")
+            return
+        self.log(f"{uni.path.name}: {uni.summary()}")
+
+        cfg = self.collect_config()
+        for combo, options, keep in (
+            (self.filter_col, uni.text + uni.numeric, cfg.parcel_filter_column),
+            (self.land_class_combo, uni.text, cfg.land_class_column),
+        ):
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItems(sorted(options))
+            combo.setCurrentText(keep)
+            combo.blockSignals(False)
+
+        self._set_filter_values(values, cfg.parcel_filter_value)
+        self._fill_checklist(self.continuous_list, uni.binnable,
+                             cfg.continuous_variables)
+        self._fill_checklist(self.seed_list, uni.seedable, cfg.seed_fields)
+        self.on_continuous_changed()
+        self.revalidate_fields()
+
+    def _set_filter_values(self, values, keep: str) -> None:
+        self.filter_val.blockSignals(True)
+        self.filter_val.clear()
+        self.filter_val.addItems(values)
+        self.filter_val.setCurrentText(keep)
+        self.filter_val.blockSignals(False)
+
+    def on_filter_column_changed(self, _text: str = "") -> None:
+        """Reload the value list, since it depends on the chosen column."""
+        path = self.parcel_edit.text().strip()
+        column = self.filter_col.currentText().strip()
+        if not path or not column or self.universe is None:
+            return
+        if column not in set(self.universe.columns):
+            self.revalidate_fields()
+            return
+        keep = self.filter_val.currentText()
+        values = fields.distinct_values(path, column, progress=self.log)
+        self._set_filter_values(values, keep)
+        self.revalidate_fields()
+
+    def on_continuous_changed(self, _item=None) -> None:
+        """Weights follow the binning selection, so the two cannot disagree."""
+        chosen = self._checked(self.continuous_list)
+        existing = self.weights_table.weights()
+        if not existing:
+            existing = {
+                fields.scored_name(c): fields.default_weight_for(c, DEFAULT_WEIGHTS)
+                for c in chosen
+            }
+        prebinned = list(self.universe.prebinned) if self.universe else []
+        candidates = chosen + [fields.source_name(c) for c in prebinned]
+        self.weights_table.set_candidates(candidates, existing)
+        self.revalidate_fields()
+
+    def revalidate_fields(self) -> List["fields.Problem"]:
+        """Check the whole field configuration against the loaded file."""
+        if self.universe is None or not self.universe.ok:
+            self.field_problems = []
+            return self.field_problems
+
+        values = [self.filter_val.itemText(i)
+                  for i in range(self.filter_val.count())] or None
+        problems = fields.validate(self.collect_config(), self.universe, values)
+        self.field_problems = problems
+
+        fatal = fields.fatal_problems(problems)
+        if not problems:
+            self.field_status.setStyleSheet("color: #2c7a3f; font-size: 10px;")
+            self.field_status.setText(
+                f"{self.universe.summary()} \u2014 all configured fields present."
+            )
+        else:
+            colour = "#c0392b" if fatal else "#b8860b"
+            self.field_status.setStyleSheet(f"color: {colour}; font-size: 10px;")
+            self.field_status.setText(
+                f"{len(fatal)} blocking, {len(problems) - len(fatal)} advisory: "
+                + "; ".join(f"{p.setting}={p.value}" for p in problems[:4])
+                + (" \u2026" if len(problems) > 4 else "")
+            )
+        return problems
 
     def on_search(self) -> None:
         query = self.jur_edit.text().strip()
@@ -680,8 +980,34 @@ class MainWindow(QtWidgets.QMainWindow):
                 "Search for a jurisdiction and pick a match first.",
             )
             return
+        if not self._fields_ok(cfg):
+            return
         jur = self.matches[idx]
         self._prepare_and_run(cfg, jurisdiction=jur, run_dir=None, checkpoint=None)
+
+    def _fields_ok(self, cfg: RunConfig) -> bool:
+        """Refuse to start on a field problem, before anything expensive.
+
+        Field validation used to happen inside load_parcels, which runs after the
+        census download and the shatter -- so a misspelled column cost minutes
+        before it surfaced. Checking here makes it cost nothing.
+        """
+        problems = self.revalidate_fields()
+        fatal = fields.fatal_problems(problems)
+        if not fatal:
+            for p in problems:
+                self.log(f"Field warning: {p}")
+            return True
+
+        detail = "\n".join(f"\u2022 {p.setting}: {p.value} \u2014 {p.detail}"
+                            for p in fatal)
+        self.log(fields.describe(problems))
+        QtWidgets.QMessageBox.warning(
+            self, "Fields don't match the parcel file",
+            f"{len(fatal)} setting(s) name something this file does not have, so "
+            "the run would fail after the downloads and tiling:\n\n" + detail,
+        )
+        return False
 
     def on_resume(self) -> None:
         run_path = self.run_combo.currentData()

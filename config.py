@@ -79,8 +79,33 @@ class RunConfig:
     # above 100k features but avoids a large download for a single small city.
     census_source: str = "tiger"
     use_osm_roads: bool = True
+    # Waterway centrelines (rivers, streams, canals, ditches) as cut lines. This
+    # had no toggle at all and fetched unconditionally, so turning roads and water
+    # off still fired an Overpass query -- and still failed on any jurisdiction
+    # Overpass refused.
+    use_osm_waterways: bool = True
     clip_water: bool = True
     adjacency_threshold_ft: float = ADJACENCY_THRESHOLD_FT
+
+    # --- adjacency ---------------------------------------------------------
+    # "tile"   : tiles adjacent if their geometry is within the threshold. The
+    #            original rule. Cheap, but a tile whose parcels sit far from the
+    #            shared edge still counts as adjacent.
+    # "parcel" : tiles adjacent if any of their *parcels* are adjacent, with an
+    #            optional line-of-sight test that drops pairs with someone else's
+    #            lot in between. See adjacency.py.
+    adjacency_mode: str = "tile"
+    require_line_of_sight: bool = True
+    # What blocks a sightline: "modeled" (only the parcels being optimized, so
+    # farmland and vacant land are transparent), "all" (every parcel), or
+    # "all_except" (every parcel bar the in-gap classes below).
+    obstacle_mode: str = "modeled"
+    transparent_land_class_keywords: List[str] = field(default_factory=list)
+    land_class_column: str = "land_class"
+    # Endpoint shrink for the sightline segment. Results are insensitive to it
+    # (0.1 ft and 0.5 ft differ by 0.1% on Lee County); it only has to exceed
+    # floating-point noise.
+    sightline_epsilon_ft: float = 0.5
 
     # --- scoring ----------------------------------------------------------
     max_bins: int = MAX_BINS

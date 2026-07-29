@@ -17,7 +17,9 @@ from typing import Callable, Dict, List, Optional, Tuple
 import geopandas as gpd
 import numpy as np
 import pandas as pd
+import shapely
 
+import adjacency
 import engine
 import parallel
 import partition
@@ -255,6 +257,109 @@ def load_parcels(
     return parcels.reset_index(drop=True)
 
 
+def load_obstacle_parcels(
+    cfg: RunConfig,
+    working_crs,
+    clip_to: Optional[gpd.GeoDataFrame] = None,
+    progress: Progress = _noop,
+) -> Tuple[Optional[np.ndarray], Optional[pd.Series]]:
+    """The *unfiltered* parcels, for the sightline obstacle set.
+
+    ``load_parcels`` throws away everything outside the model group, but
+    ``obstacle_mode`` "all" / "all_except" need those rows back -- an agricultural
+    parcel blocks a sightline even though it is never optimized. Only geometry and
+    the land-class column are read, so this is cheap next to the main load.
+    """
+    path = Path(cfg.parcel_path)
+    if not path.exists():
+        progress(f"Cannot read obstacles: {path} is missing")
+        return None, None
+
+    want = ["geometry"]
+    land_col = cfg.land_class_column
+    try:
+        if path.suffix.lower() in (".parquet", ".pq"):
+            import pyarrow.parquet as pq
+
+            available = set(pq.ParquetFile(path).schema_arrow.names)
+            if land_col in available:
+                want.append(land_col)
+            frame = gpd.read_parquet(path, columns=want)
+        else:
+            frame = gpd.read_file(path)
+            if land_col not in frame.columns:
+                land_col = None
+    except Exception as exc:  # noqa: BLE001
+        progress(f"Cannot read obstacles ({exc}); sightlines will use the "
+                 "modeled parcels only.")
+        return None, None
+
+    frame = frame[~frame.geometry.is_empty & frame.geometry.notna()]
+    if frame.crs is not None and frame.crs != working_crs:
+        frame = frame.to_crs(working_crs)
+    if clip_to is not None and len(clip_to):
+        area = clip_to.to_crs(working_crs).geometry.union_all()
+        shapely.prepare(area)
+        inside = shapely.intersects(area, frame.geometry.to_numpy())
+        frame = frame[inside]
+
+    progress(f"Obstacle candidates: {len(frame):,} parcels of every class")
+    land = frame[land_col] if land_col and land_col in frame.columns else None
+    if land is None:
+        progress(
+            f"No '{cfg.land_class_column}' column, so in-gap classes cannot be "
+            "identified; 'all_except' will behave like 'all'."
+        )
+    return frame.geometry.to_numpy(), land
+
+
+def build_tile_adjacency(
+    parcels: gpd.GeoDataFrame,
+    adj_tiles: gpd.GeoDataFrame,
+    cfg: RunConfig,
+    jur_gdf: Optional[gpd.GeoDataFrame] = None,
+    progress: Progress = _noop,
+) -> Dict[int, set]:
+    """Tile adjacency, by whichever rule ``cfg.adjacency_mode`` selects."""
+    if cfg.adjacency_mode != "parcel":
+        return tiles_mod.calculate_adjacency(
+            adj_tiles, cfg.adjacency_threshold_ft, progress=progress
+        )
+
+    modeled = parcels.geometry.to_numpy()
+    all_geoms = land = None
+    if cfg.obstacle_mode != "modeled" and cfg.require_line_of_sight:
+        all_geoms, land = load_obstacle_parcels(
+            cfg, parcels.crs, clip_to=jur_gdf, progress=progress
+        )
+
+    obstacles = adjacency.select_obstacles(
+        modeled, mode=cfg.obstacle_mode, all_geoms=all_geoms,
+        all_land_class=land,
+        keywords=(cfg.transparent_land_class_keywords
+                  or adjacency.DEFAULT_TRANSPARENT_KEYWORDS),
+        progress=progress,
+    )
+    result = adjacency.build_parcel_adjacency(
+        modeled,
+        threshold_ft=cfg.adjacency_threshold_ft,
+        obstacle_geoms=obstacles,
+        require_line_of_sight=cfg.require_line_of_sight,
+        epsilon_ft=cfg.sightline_epsilon_ft,
+        progress=progress,
+    )
+    adj = result.to_tile_adjacency(
+        parcels["tile_id"].to_numpy(),
+        all_tiles=np.asarray(adj_tiles.index, dtype=np.int64),
+    )
+    edges = sum(len(v) for v in adj.values()) // 2
+    progress(
+        f"Adjacency: {len(adj):,} tiles, {edges:,} tile edges "
+        f"({edges / max(len(adj), 1):.2f} avg)"
+    )
+    return adj
+
+
 def parcel_field_candidates(path: str | Path) -> List[str]:
     """Numeric columns in a parcel file, for populating the weights editor."""
     path = Path(path)
@@ -345,11 +450,19 @@ def prepare(
             sources.fetch_osm_roads(jurisdiction, progress=progress)
             if cfg.use_osm_roads else None
         )
-        water_lines = sources.fetch_osm_waterway_lines(jurisdiction, progress=progress)
+        water_lines = (
+            sources.fetch_osm_waterway_lines(jurisdiction, progress=progress)
+            if cfg.use_osm_waterways else None
+        )
         water_areas = (
             sources.fetch_osm_water_areas(jurisdiction, progress=progress)
             if cfg.clip_water else None
         )
+        if not (cfg.use_osm_roads or cfg.use_osm_waterways or cfg.clip_water):
+            progress(
+                "Every OSM layer is switched off, so Overpass was not contacted; "
+                "tiles come from census blocks plus the grid alone."
+            )
         tileset = tiles_mod.build_tileset(
             jur_gdf,
             blocks,
@@ -394,8 +507,8 @@ def prepare(
     # ---- 5. adjacency ----------------------------------------------------
     populated = sorted(tile_to_parcels.keys())
     adj_tiles = all_tiles.loc[all_tiles.index.intersection(populated)]
-    tile_adj = tiles_mod.calculate_adjacency(
-        adj_tiles, cfg.adjacency_threshold_ft, progress=progress
+    tile_adj = build_tile_adjacency(
+        parcels, adj_tiles, cfg, jur_gdf=jur_gdf, progress=progress
     )
 
     # ---- 6. seeding ------------------------------------------------------

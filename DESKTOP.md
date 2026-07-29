@@ -13,6 +13,8 @@ python tests/test_parallel.py     # offline, spawns real processes, ~30s
 python tests/test_contiguity.py   # offline, ~25s
 python tests/test_water_clip.py   # offline, ~10s
 python tests/test_shutdown.py     # offline, ~5s
+python tests/test_adjacency.py    # offline, ~5s
+python tests/test_fields.py       # offline, ~5s
 ```
 
 ---
@@ -89,6 +91,29 @@ The subtle part: an over-budget Overpass query returns **HTTP 200 with partial
 data** and an explanation in a `remark` field. That's checked explicitly —
 otherwise the study area quietly loses roads.
 
+**"Too big" and "busy" are different things**, and conflating them makes the
+subdivide response actively harmful. `OverpassTooBig` causes the caller to split
+into four and issue four more queries, which is right for an over-budget extent
+and exactly wrong for a rate limit — quadrupling the request count is the
+opposite of what a 429 asks for. So:
+
+| response | meaning | action |
+|---|---|---|
+| 200 + truncation `remark` | definitively over budget | split immediately |
+| 429 / 503 | rate limited, no slot | back off, try the next endpoint |
+| 504 from one endpoint | ambiguous | try the others first |
+| 504 from *every* endpoint | points at extent | split |
+| 400 | server rejected the extent | split |
+
+**Every OSM layer has a toggle, and `prepare()` honours all of them.** The
+waterway-centreline fetch previously had none and ran unconditionally, so
+switching roads and water off in the UI still fired an Overpass query — and still
+failed on any jurisdiction Overpass refused (which is how it surfaced, on Beckham
+County). `use_osm_waterways` now guards it, and with every OSM layer off Overpass
+is not contacted at all. `test_every_osm_layer_has_a_toggle_that_prepare_honours`
+walks the AST of `prepare()` and fails if any `fetch_osm*` call is unguarded, so a
+future layer can't repeat it.
+
 ### Measured at full Lee County scale
 
 276,617 single-family parcels over a 44 × 33 mile extent, 500 ft grid, 30k road
@@ -115,6 +140,64 @@ Cook County should be broadly similar in area but several times denser, so expec
 the shatter and the render to scale up by that factor and the iteration rate to
 hold. The untested risks there are peak memory during `polygonize` and the
 initial ~100 MB Illinois download.
+
+---
+
+## Field pickers, and failing early
+
+Every setting that names a column used to be free text, and field validation
+lived in `pipeline.load_parcels` — step 4 of `prepare()`, *after* the census
+download and the shatter. A misspelled weight therefore cost a full download plus
+tiling before it surfaced.
+
+`fields.py` reads the schema instead, which is cheap enough to do the moment a
+file is named: **11 ms** for the schema of a 158 MB / 126-column parquet, **44–130
+ms** to pull a whole column for its distinct values. So the pickers are populated
+and the config is validated on selection, and Start is refused with a message
+naming the offending settings.
+
+The non-obvious part is that scored fields are **not** file columns.
+`bldg_area_finished_sqft_binned` is manufactured later by `bin_continuous_fields`,
+and `assr_impr_ppsf` is derived from `assr_market_value`. So `FieldUniverse`
+computes the *post-preparation* universe: file columns, plus derivable ratios
+whose inputs are present, plus the `_binned` forms that binning will create.
+
+Design choices worth recording:
+
+- **Editable combos, not dropdowns.** They must still work before a file is
+  chosen, must cope with formats we can't introspect quickly, and must not
+  discard a value loaded from an older `run_config.json` that names a column this
+  file lacks. Missing values stay on screen, flagged red.
+- **Weights rows are derived from the binning selection**, not typed. That makes
+  the commonest silent misconfiguration impossible by construction: a weight on a
+  column that exists but is never binned, so its `_binned` form is never created.
+  `test_weight_on_an_unbinned_column_is_caught` pins it.
+- **Displayed names are source columns; stored keys keep the `_binned` suffix**,
+  so `run_config.json` and the notebook's `WEIGHTS` dict stay compatible.
+- **`continuous_variables` and `seed_fields` are now in the UI.** They were
+  config-only and are the most jurisdiction-specific settings there are — the
+  likeliest thing to break on new data, as Beckham proved.
+
+### Validated across two real jurisdictions
+
+| | Lee County FL | Beckham County OK |
+|---|---|---|
+| parcels | 558,688 | 16,172 |
+| columns | 126 | 94 |
+| `model_group` values | single_family, res_vacant, condos, … | single_family, agricultural, rural_single_family, … |
+| `land_class` | present (87 classes) | **absent** |
+| `dist_to_open_water` | present | **absent** (landlocked) |
+| stock config | validates | **2 blocking problems** |
+
+Beckham rejects the stock config in ~50 ms rather than failing after the
+download and shatter, and passes once the absent fields are deselected. Note its
+`model_group` carries both `single_family` and `rural_single_family` — the current
+filter is a single `column == value`, so covering both would need a multi-value
+filter that doesn't exist yet.
+
+`test_the_two_real_files_are_different_jurisdictions` compares mean latitude,
+because the first Beckham file supplied was a copy of the Lee data and would have
+made any A/B comparison silently vacuous.
 
 ---
 
@@ -148,6 +231,76 @@ index the mask and touch only the tiles that actually meet it.
 `test_clip_out_helper_matches_the_naive_union_difference` pins it against the
 slow one-liner; `test_clipping_is_not_quadratic_in_tile_count` fails if per-tile
 clipping ever returns.
+
+---
+
+## Adjacency: distance plus line of sight
+
+A distance threshold cannot distinguish two situations that look identical to it:
+
+* two lots facing each other across a canal or street — genuinely neighbours;
+* two lots on the same street with a third lot between them — not neighbours, but
+  within 100 ft because lots are only 60 ft wide.
+
+What separates them is whether there is *parcel* in the way. In Lee County only
+598 of 558,688 parcels are RIGHT-OF-WAY and 338 are submerged land, so streets
+and canals are effectively unparceled: a line cast across one hits nothing, while
+a line cast over an intervening lot hits it.
+
+`adjacency_mode = "parcel"` takes candidate pairs within the threshold and keeps
+an edge only when the shortest segment between the two parcels is clear of
+obstacles. Cost on all 276,617 parcels: **~3 s at 100 ft, ~25 s at 250 ft**, once,
+cacheable. `shortest_line` is vectorised C in shapely 2 and is *not* the
+bottleneck — the `dwithin` candidate query is.
+
+### Two details that dominate the result
+
+**Touching pairs must be kept unconditionally.** Their shortest line is a
+zero-length point, and in a subdivision that point usually sits where three or
+four lots meet, so an intersection test "finds" a third parcel there and deletes
+a legitimate edge. 30% of candidate pairs touch. Not special-casing them pushed
+the measured drop rate from 24% to **80%** — enough to make the whole idea look
+broken.
+
+**The segment must be pulled in from both ends.** A shortest line's endpoints lie
+*on* both parcels' boundaries by construction. Shrinking by `min(0.5 ft, gap/4)`
+removes that, and once shrunk the segment cannot touch either endpoint parcel at
+all — verified identical results with and without pair-exclusion bookkeeping, so
+the obstacle set can be a completely unrelated frame. Results are insensitive to
+the epsilon (0.1 ft vs 0.5 ft differ by 0.1%); it only has to exceed FP noise.
+
+### Measured on Lee County (276,617 single-family parcels, 55,304 tiles)
+
+| rule | edges | components | largest | ceiling | pairs cut |
+|---|---|---|---|---|---|
+| tile geometry, 100 ft *(default)* | 180,319 | 1,012 | 23.0% | 4.35x | — |
+| parcel, 100 ft, LOS off | 119,961 | 3,995 | 8.7% | 11.51x | — |
+| parcel, 100 ft, blocked by modeled | 114,505 | 3,995 | 8.7% | 11.51x | 21.6% |
+| parcel, 100 ft, blocked by all | 97,946 | 5,321 | 8.6% | 11.67x | 44.4% |
+| parcel, 100 ft, blocked by all_except | 109,109 | 4,674 | 8.6% | 11.57x | 26.9% |
+| parcel, 250 ft, blocked by modeled | 167,715 | 1,407 | 16.1% | 6.20x | 44.0% |
+
+Three things fall out of that table.
+
+**The sightline test does not fragment the graph.** With LOS off at 100 ft you get
+3,995 components; with it on, 3,995 — identical. It removes ~5,500 edges without
+disconnecting anything new, i.e. it prunes redundant diagonal shortcuts inside
+already-connected clusters. That is exactly the intent.
+
+**Parcel adjacency is far stricter than tile adjacency at the same threshold.**
+Components go 1,012 → 3,995, because tiles are large and touch each other while
+their parcels may sit hundreds of feet apart. So switching to parcel adjacency
+without raising the threshold solves fewer tiny independent problems — likely
+worse for quality, not better. 250 ft brings it back to 1,407 components.
+
+**The obstacle mode barely moves connectivity, only edge count.** All three modes
+land at ~8.6% largest component. So obstacle choice matters for *which*
+relationships survive, not for whether pockets reconnect — reconnecting across a
+wide gap needs a bigger threshold, and the sightline test is what makes a bigger
+threshold safe.
+
+`adjacency_mode` defaults to `"tile"`, so nothing changes until you switch it.
+Both settings are in the UI (Adjacency / Blocked by) for A/B comparison.
 
 ---
 
@@ -532,7 +685,9 @@ delete `.mi_cache/` to re-download.
 | `geo.py` | picks a feet-based CRS for a study area |
 | `sources.py` | TIGERweb search, REST blocks, adaptive Overpass, disk cache |
 | `tiger.py` | bulk TIGER/Line block shapefiles: vintage probe, download, `/vsizip/` read |
-| `tiles.py` | 500 ft grid, shatter, water clip, parcel↔tile join, adjacency |
+| `tiles.py` | 500 ft grid, shatter, water clip, parcel↔tile join, tile adjacency |
+| `adjacency.py` | parcel adjacency with a line-of-sight rule and obstacle sets |
+| `fields.py` | reads a parcel file's schema and validates a config against it |
 | `mi.py` | flat-bin count tables and weighted MI |
 | `engine.py` | `TiledOptimizer`: consolidation pass, annealing loop, pause/stop |
 | `checkpoints.py` | checkpoint format, store, pruning, run discovery |

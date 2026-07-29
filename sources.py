@@ -471,15 +471,56 @@ def _check_remark(data: dict) -> None:
         raise OverpassTooBig(remark.strip())
 
 
+#: How long to wait when an endpoint says it is rate limited.
+RATE_LIMIT_BACKOFF_S = 30.0
+
+
 def _overpass(query: str, progress: Progress = _noop, timeout: int = 300) -> dict:
+    """Run one Overpass query, distinguishing "too big" from "busy".
+
+    The distinction matters because the caller's response to ``OverpassTooBig`` is
+    to split the area into four and issue four more queries. That is right when
+    the query genuinely exceeds a budget, and actively harmful when the server is
+    merely overloaded or rate limiting us -- quadrupling the request count is the
+    opposite of what a 429 is asking for.
+
+    So: a ``remark`` in a 200 response is definitive evidence of truncation and
+    splits immediately. A 429 backs off and moves on. A 504 might be either, so
+    every endpoint is tried before concluding the area is too big.
+    """
     last: Optional[Exception] = None
+    gateway_timeouts = 0
     for url in OVERPASS_ENDPOINTS:
+        host = url.split("/")[2]
         try:
-            progress(f"Overpass: querying {url.split('/')[2]}...")
+            progress(f"Overpass: querying {host}...")
             with _session() as s:
                 r = s.post(url, data={"data": query}, timeout=timeout)
-                if r.status_code in (400, 429, 504):
-                    raise OverpassTooBig(f"HTTP {r.status_code}")
+
+                if r.status_code in (429, 503):
+                    # Rate limited / no slot free. Splitting would make it worse.
+                    progress(
+                        f"Overpass: {host} is rate limiting (HTTP "
+                        f"{r.status_code}); waiting {RATE_LIMIT_BACKOFF_S:.0f}s "
+                        "and trying the next endpoint"
+                    )
+                    last = RuntimeError(f"HTTP {r.status_code} from {host}")
+                    time.sleep(RATE_LIMIT_BACKOFF_S)
+                    continue
+
+                if r.status_code == 504:
+                    # Could be size, could be an overloaded gateway. Exhaust the
+                    # other endpoints before deciding to subdivide.
+                    gateway_timeouts += 1
+                    progress(f"Overpass: {host} timed out (HTTP 504)")
+                    last = RuntimeError(f"HTTP 504 from {host}")
+                    continue
+
+                if r.status_code == 400:
+                    # Our queries are generated, so a bad request here means the
+                    # server rejected the extent rather than the syntax.
+                    raise OverpassTooBig(f"HTTP 400 from {host}")
+
                 r.raise_for_status()
                 data = r.json()
             _check_remark(data)
@@ -488,8 +529,14 @@ def _overpass(query: str, progress: Progress = _noop, timeout: int = 300) -> dic
             raise  # splitting the area is the fix, not another endpoint
         except Exception as exc:  # noqa: BLE001
             last = exc
-            progress(f"Overpass: {url.split('/')[2]} failed ({exc}); trying next")
+            progress(f"Overpass: {host} failed ({exc}); trying next")
             time.sleep(2)
+
+    if gateway_timeouts == len(OVERPASS_ENDPOINTS):
+        # Every endpoint timed out on the same extent, which does point at size.
+        raise OverpassTooBig(
+            f"all {gateway_timeouts} endpoints returned HTTP 504"
+        )
     raise RuntimeError(f"All Overpass endpoints failed: {last}")
 
 
